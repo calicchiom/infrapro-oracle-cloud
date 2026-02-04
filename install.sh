@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ===== Non-interactive / no UI (evita travar em prompts como needrestart) =====
+# ===== Non-interactive / no UI =====
 export DEBIAN_FRONTEND=noninteractive
-export NEEDRESTART_MODE=a       # a=auto (não abre UI)
-export NEEDRESTART_SUSPEND=1    # suspende prompts do needrestart durante o apt
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
 export UCF_FORCE_CONFFOLD=1
 
 trap 'echo -e "\n❌ ERRO: Falha na linha $LINENO. Comando: $BASH_COMMAND" >&2' ERR
 
-TITLE="InfraPro Cloud Oracle - criado por Márcio Calicchio - v1.1.2"
+TITLE="InfraPro Cloud Oracle - criado por Márcio Calicchio - v1.1.3"
 
 LOG_FILE="$HOME/infrapro-install.log"
 LOCK_FILE="$HOME/.infrapro.lock"
@@ -45,19 +45,10 @@ Auto-start via curl:
 EOF
 }
 
-# ---------------- Args (FIX curl|bash + args vazios) ----------------
+# ---------------- Args ----------------
 parse_args() {
-  # robusto para:
-  # - ./install.sh --debug
-  # - curl ... | bash
-  # - curl ... | bash -s -- --debug
   while (( $# )); do
-    # ignora argumentos vazios
-    if [[ -z "${1:-}" ]]; then
-      shift
-      continue
-    fi
-
+    if [[ -z "${1:-}" ]]; then shift; continue; fi
     case "$1" in
       --debug) DEBUG=1; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -132,12 +123,10 @@ apt_update() { sudo apt-get update "${APT_OPTS[@]}"; }
 apt_install() { sudo apt-get install "${APT_OPTS[@]}" "$@"; }
 apt_upgrade() { sudo apt-get upgrade "${APT_OPTS[@]}"; }
 
-# Evita prompt do grub/bootloader em alguns cenários
-preseed_grub() {
-  if command -v debconf-set-selections >/dev/null 2>&1; then
-    echo 'grub-pc grub-pc/install_devices_empty boolean true' | sudo debconf-set-selections || true
-    echo 'grub-pc grub-pc/install_devices multiselect' | sudo debconf-set-selections || true
-  fi
+apt_setup_retries() {
+  sudo tee /etc/apt/apt.conf.d/80infrapro-retries >/dev/null <<'EOF'
+Acquire::Retries "3";
+EOF
 }
 
 apt_install_if_missing() {
@@ -146,45 +135,58 @@ apt_install_if_missing() {
     dpkg -s "$pkg" >/dev/null 2>&1 || to_install+=("$pkg")
   done
   if ((${#to_install[@]})); then
-    preseed_grub
     apt_update
     apt_install "${to_install[@]}"
   fi
 }
 
-apt_setup_retries() {
-  sudo tee /etc/apt/apt.conf.d/80infrapro-retries >/dev/null <<'EOF'
-Acquire::Retries "3";
-EOF
-}
-
 configure_needrestart_noninteractive() {
-  # Mantém a função do needrestart, mas impede UI interativa que trava o script.
-  step "Configurando needrestart para modo não-interativo (evita popup de kernel)"
+  step "Configurando needrestart para modo não-interativo"
   sudo mkdir -p /etc/needrestart/conf.d
   sudo tee /etc/needrestart/conf.d/99-infrapro.conf >/dev/null <<'EOF'
-# InfraPro: não abrir UI interativa em upgrades
-$nrconf{restart} = 'a';      # a=automatic, l=list only, i=interactive
-$nrconf{kernelhints} = 0;    # não mostrar tela de kernel pendente
+$nrconf{restart} = 'a';
+$nrconf{kernelhints} = 0;
 EOF
   ok "needrestart configurado."
 }
 
-kernel_reboot_hint() {
-  # Melhor esforço: detecta se um reboot é recomendado (sem interromper)
-  local running expected
-  running="$(uname -r 2>/dev/null || true)"
-  expected="$(dpkg-query -W -f='${Version}\n' "linux-image-$(uname -r)" 2>/dev/null || true)"
+# ---------------- Kernel hold (evitar atualizar kernel) ----------------
+hold_kernel_packages() {
+  step "Aplicando HOLD em pacotes de kernel para evitar atualização e popup"
 
-  # Heurística simples: se há pacote de kernel mais novo instalado do que o em execução,
-  # o needrestart avisaria. A forma mais confiável é checar /var/run/reboot-required.
-  if [[ -f /var/run/reboot-required ]]; then
-    warn "Reboot recomendado (arquivo /var/run/reboot-required detectado)."
-    info "Quando possível, rode: sudo reboot"
+  # Pacotes comuns que puxam kernel no Ubuntu/Oracle
+  local candidates=(
+    linux-image-oracle
+    linux-headers-oracle
+    linux-modules-oracle
+    linux-modules-extra-oracle
+    linux-oracle
+    linux-generic
+    linux-image-generic
+    linux-headers-generic
+  )
+
+  # Também segura o kernel específico em execução (se existir como pacote)
+  local running
+  running="$(uname -r)"
+  candidates+=("linux-image-$running" "linux-headers-$running" "linux-modules-$running")
+
+  local to_hold=()
+  local p
+  for p in "${candidates[@]}"; do
+    if dpkg -s "$p" >/dev/null 2>&1; then
+      to_hold+=("$p")
+    fi
+  done
+
+  if ((${#to_hold[@]}==0)); then
+    warn "Nenhum pacote de kernel candidato encontrado para HOLD (ok)."
+    return 0
   fi
 
-  # Apenas log extra (não crítico)
-  info "Kernel em execução: ${running}"
+  # marca hold
+  printf '%s\n' "${to_hold[@]}" | sudo xargs -r apt-mark hold >/dev/null
+  ok "Kernel HOLD aplicado: ${to_hold[*]}"
 }
 
 # ---------------- Lock ----------------
@@ -204,7 +206,7 @@ state_init() {
   if [[ ! -f "$STATE_FILE" ]]; then
     cat >"$STATE_FILE" <<'JSON'
 {
-  "version": "1.1.2",
+  "version": "1.1.3",
   "checkpoints": {}
 }
 JSON
@@ -212,41 +214,19 @@ JSON
   fi
 }
 
-state_set() { # key value(string)
-  local key="$1"; local val="$2"
-  local tmp
-  tmp="$(mktemp)"
-  jq --arg k "$key" --arg v "$val" '.checkpoints[$k]=$v' "$STATE_FILE" >"$tmp"
-  mv "$tmp" "$STATE_FILE"
-}
-
-state_get() { # key
-  local key="$1"
-  jq -r --arg k "$key" '.checkpoints[$k] // empty' "$STATE_FILE"
-}
+state_set() { local key="$1"; local val="$2"; local tmp; tmp="$(mktemp)"; jq --arg k "$key" --arg v "$val" '.checkpoints[$k]=$v' "$STATE_FILE" >"$tmp"; mv "$tmp" "$STATE_FILE"; }
+state_get() { local key="$1"; jq -r --arg k "$key" '.checkpoints[$k] // empty' "$STATE_FILE"; }
 
 # ---------------- Input validation ----------------
-valid_hostname() {
-  local h="$1"
-  [[ "$h" != http://* && "$h" != https://* ]] || return 1
-  [[ "$h" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[A-Za-z]{2,63}$ ]]
-}
-dns_resolves() {
-  dig +time=2 +tries=2 +short A "$1" | head -n1 | grep -q . || \
-  dig +time=2 +tries=2 +short AAAA "$1" | head -n1 | grep -q .
-}
+valid_hostname() { local h="$1"; [[ "$h" != http://* && "$h" != https://* ]] || return 1; [[ "$h" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
+dns_resolves() { dig +time=2 +tries=2 +short A "$1" | head -n1 | grep -q . || dig +time=2 +tries=2 +short AAAA "$1" | head -n1 | grep -q .; }
 valid_portainer_user() { [[ "$1" =~ ^[A-Za-z0-9_]{3,}$ ]]; }
 valid_docker_net() { [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$ ]]; }
 valid_email() { [[ "$1" =~ ^[A-Za-z0-9._%+-]+@([A-Za-z0-9-]+\.)+[A-Za-z]{2,63}$ ]]; }
-email_domain_resolves() {
-  local d="${1#*@}"
-  dig +time=2 +tries=2 +short MX "$d" | head -n1 | grep -q . || \
-  dig +time=2 +tries=2 +short A "$d" | head -n1 | grep -q .
-}
+email_domain_resolves() { local d="${1#*@}"; dig +time=2 +tries=2 +short MX "$d" | head -n1 | grep -q . || dig +time=2 +tries=2 +short A "$d" | head -n1 | grep -q .; }
 
 prompt_inputs() {
   info "Informe os dados (com validação)."
-
   while true; do
     read -r -p "URL do Portainer (ex: painel.seudominio.com): " URL_PORTAINER
     URL_PORTAINER="${URL_PORTAINER,,}"
@@ -254,13 +234,11 @@ prompt_inputs() {
     dns_resolves "$URL_PORTAINER" || { warn "DNS não resolve para $URL_PORTAINER. Ajuste e tente novamente."; continue; }
     break
   done
-
   while true; do
     read -r -p "Usuário admin do Portainer (>=3, alfanumérico e underscore): " USUARIO_ADMIN
     valid_portainer_user "$USUARIO_ADMIN" || { warn "Usuário inválido."; continue; }
     break
   done
-
   while true; do
     read -r -s -p "Senha do Portainer (mínimo 12 caracteres): " SENHA_PORTAINER; echo
     ((${#SENHA_PORTAINER} >= 12)) || { warn "Senha muito curta."; continue; }
@@ -268,13 +246,11 @@ prompt_inputs() {
     [[ "$SENHA_PORTAINER" == "$SENHA_PORTAINER_CONFIRM" ]] || { warn "Senhas não conferem."; continue; }
     break
   done
-
   while true; do
     read -r -p "Nome da rede Swarm (ex: infrapro_net): " NOME_REDE_USUARIO
     valid_docker_net "$NOME_REDE_USUARIO" || { warn "Nome de rede inválido."; continue; }
     break
   done
-
   while true; do
     read -r -p "Email para certificados SSL (Let's Encrypt): " EMAIL_SSL
     valid_email "$EMAIL_SSL" || { warn "Email inválido."; continue; }
@@ -299,7 +275,7 @@ EOF
   ok "$ENV_FILE criado."
 }
 
-# ---------------- Repo bootstrap (auto-start via curl) ----------------
+# ---------------- Repo bootstrap ----------------
 REPO_URL="https://github.com/calicchiom/infrapro-oracle-cloud"
 REPO_DIR="$HOME/infrapro-oracle-cloud"
 
@@ -313,11 +289,9 @@ ensure_repo_and_reexec() {
       git clone "$REPO_URL" "$REPO_DIR"
       ok "Clone concluído em $REPO_DIR"
     fi
-
     step "chmod +x install.sh e uninstall.sh no repositório"
     [[ -f "$REPO_DIR/install.sh" ]] && chmod +x "$REPO_DIR/install.sh" || true
     [[ -f "$REPO_DIR/uninstall.sh" ]] && chmod +x "$REPO_DIR/uninstall.sh" || true
-
     step "Reexecutando automaticamente a partir do repositório..."
     if (( DEBUG )); then
       INFRAPRO_CLONED=1 exec "$REPO_DIR/install.sh" --debug
@@ -328,51 +302,31 @@ ensure_repo_and_reexec() {
 }
 
 # ---------------- YAML render ----------------
-render_yaml_with_vars() { # <src> <dst>
-  local src="$1" dst="$2"
-  [[ -f "$src" ]] || { err "Arquivo não encontrado: $src"; return 1; }
-
-  export SWARM_NETWORK="$NOME_REDE_USUARIO"
-  export PORTAINER_URL="$URL_PORTAINER"
-  export SSL_EMAIL="$EMAIL_SSL"
-
-  if command -v envsubst >/dev/null 2>&1; then
-    envsubst '${SWARM_NETWORK} ${PORTAINER_URL} ${SSL_EMAIL}' <"$src" >"$dst"
-  else
-    err "envsubst não encontrado (instale gettext-base)."
-    return 1
-  fi
-
+render_yaml_with_vars() { local src="$1" dst="$2"; [[ -f "$src" ]] || { err "Arquivo não encontrado: $src"; return 1; }
+  export SWARM_NETWORK="$NOME_REDE_USUARIO"; export PORTAINER_URL="$URL_PORTAINER"; export SSL_EMAIL="$EMAIL_SSL"
+  command -v envsubst >/dev/null 2>&1 || { err "envsubst não encontrado (instale gettext-base)."; return 1; }
+  envsubst '${SWARM_NETWORK} ${PORTAINER_URL} ${SSL_EMAIL}' <"$src" >"$dst"
   if grep -q '\${[A-Za-z_][A-Za-z0-9_]*}' "$dst"; then
-    err "Variáveis não resolvidas em $dst:"
-    grep -n '\${[A-Za-z_][A-Za-z0-9_]*}' "$dst" || true
-    return 1
+    err "Variáveis não resolvidas em $dst:"; grep -n '\${[A-Za-z_][A-Za-z0-9_]*}' "$dst" || true; return 1
   fi
 }
 
 copy_and_render_yamls() {
-  step "Copiando YAMLs do repo (raiz, *.yaml) e renderizando no HOME"
-
-  local t="$REPO_DIR/traefik.yaml"
-  local p="$REPO_DIR/portainer.yaml"
-
+  step "Copiando YAMLs do repo e renderizando no HOME"
+  local t="$REPO_DIR/traefik.yaml" p="$REPO_DIR/portainer.yaml"
   [[ -f "$t" ]] || { err "YAML não encontrado: $t"; exit 1; }
   [[ -f "$p" ]] || { err "YAML não encontrado: $p"; exit 1; }
-
-  cp -f "$t" "$HOME/traefik.yaml.tpl"
-  cp -f "$p" "$HOME/portainer.yaml.tpl"
-
+  cp -f "$t" "$HOME/traefik.yaml.tpl"; cp -f "$p" "$HOME/portainer.yaml.tpl"
   step "Renderizando para ~/traefik.yaml e ~/portainer.yaml"
   render_yaml_with_vars "$HOME/traefik.yaml.tpl" "$HOME/traefik.yaml"
   render_yaml_with_vars "$HOME/portainer.yaml.tpl" "$HOME/portainer.yaml"
-
   ok "YAMLs prontos."
 }
 
 # ---------------- Dependencies ----------------
 install_dependencies() {
   step "Instalando dependências essenciais"
-  apt_install_if_missing curl wget git ca-certificates gnupg lsb-release apt-transport-https software-properties-common dnsutils jq unzip net-tools htop tree vim nano gettext-base util-linux debconf-utils needrestart
+  apt_install_if_missing curl wget git ca-certificates gnupg lsb-release apt-transport-https software-properties-common dnsutils jq unzip net-tools htop tree vim nano gettext-base util-linux needrestart
   local cmds=(curl wget git gpg lsb_release dig jq unzip netstat envsubst flock)
   for c in "${cmds[@]}"; do require_cmd "$c"; done
   ok "Dependências OK."
@@ -407,12 +361,12 @@ remove_unattended_upgrades_pkg() {
 }
 
 update_upgrade_and_apparmor() {
-  step "FASE 1.3 — Update/upgrade (non-interactive) + apparmor-utils"
-  preseed_grub
+  step "FASE 1.3 — Update/upgrade (non-interactive, sem kernel) + apparmor-utils"
+  hold_kernel_packages
   apt_update
   apt_upgrade
   apt_install apparmor-utils
-  ok "Sistema atualizado (non-interactive) + apparmor-utils."
+  ok "Sistema atualizado sem atualizar kernel."
 }
 
 configure_ufw() {
@@ -439,7 +393,6 @@ install_docker() {
   else
     ok "Docker já instalado."
   fi
-
   sudo systemctl enable --now docker
   sudo systemctl enable --now containerd
   sudo docker version >/dev/null
@@ -460,7 +413,6 @@ init_swarm_and_network() {
   else
     ok "Swarm já ativo."
   fi
-
   if sudo docker network ls --format '{{.Name}}' | grep -qx "$NOME_REDE_USUARIO"; then
     ok "Rede já existe: $NOME_REDE_USUARIO"
   else
@@ -483,12 +435,8 @@ deploy_portainer() {
   ok "Portainer convergiu."
 }
 
-# ---------------- Portainer bootstrap (version/status aware, best-effort) ----------------
-portainer_get_status_json() {
-  local base="https://${URL_PORTAINER}"
-  curlkx -H 'Accept: application/json' "${base}/api/status" 2>/dev/null || return 1
-}
-
+# ---------------- Portainer bootstrap ----------------
+portainer_get_status_json() { local base="https://${URL_PORTAINER}"; curlkx -H 'Accept: application/json' "${base}/api/status" 2>/dev/null || return 1; }
 portainer_wait_api() {
   local base="https://${URL_PORTAINER}"
   step "Aguardando Portainer API em ${base}/api/status (timeout ~240s)"
@@ -503,7 +451,6 @@ portainer_wait_api() {
   done
   return 1
 }
-
 portainer_try_auth() {
   local base="https://${URL_PORTAINER}"
   local code jwt
@@ -521,16 +468,13 @@ portainer_try_auth() {
   rm -f /tmp/pauth.json 2>/dev/null || true
   return 1
 }
-
-portainer_try_init() { # endpoint URL
-  local url="$1"
-  local code
+portainer_try_init() {
+  local url="$1" code
   code="$(curl -k -sS -o /tmp/pinit.json -w '%{http_code}' \
     --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
     -H 'Content-Type: application/json' \
     -d "{\"Username\":\"${USUARIO_ADMIN}\",\"Password\":\"${SENHA_PORTAINER}\"}" \
     "$url" || echo "000")"
-
   case "$code" in
     200|204) rm -f /tmp/pinit.json; ok "Init admin OK via $url (HTTP $code)"; return 0 ;;
     409)     rm -f /tmp/pinit.json; warn "Já inicializado (HTTP 409) via $url"; return 0 ;;
@@ -538,58 +482,20 @@ portainer_try_init() { # endpoint URL
     *)       rm -f /tmp/pinit.json; warn "Falha init via $url (HTTP $code)"; return 1 ;;
   esac
 }
-
 bootstrap_portainer_admin() {
-  step "BOOTSTRAP — Portainer admin (resiliente / status+version aware, best-effort)"
-
-  if ! portainer_wait_api; then
-    warn "Portainer API não respondeu a tempo. Bootstrap não executado."
-    return 1
-  fi
-
-  # Se já autentica, está pronto
-  if portainer_try_auth; then
-    ok "Portainer já aceita login com as credenciais informadas."
-    return 0
-  fi
-
-  # Log version/status se disponível
+  step "BOOTSTRAP — Portainer admin (best-effort)"
+  if ! portainer_wait_api; then warn "Portainer API não respondeu a tempo."; return 1; fi
+  if portainer_try_auth; then ok "Portainer já aceita login com as credenciais informadas."; return 0; fi
   local status_json version
   status_json="$(portainer_get_status_json || true)"
   version="$(jq -r '.Version // .version // empty' <<<"$status_json" 2>/dev/null || true)"
-  if [[ -n "$version" ]]; then
-    info "Portainer version detectada via /api/status: $version"
-  else
-    info "Não foi possível detectar a versão via /api/status (ok)."
-  fi
-
-  # Tenta endpoints conhecidos/heurísticos (best-effort; latest pode mudar)
+  [[ -n "$version" ]] && info "Portainer version: $version" || info "Versão não detectada (ok)."
   local base="https://${URL_PORTAINER}"
-  local endpoints=(
-    "${base}/api/users/admin/init"
-    "${base}/api/users/admin/init/force"
-    "${base}/api/users/admin/initialize"
-  )
-
+  local endpoints=("${base}/api/users/admin/init" "${base}/api/users/admin/init/force" "${base}/api/users/admin/initialize")
   local ep rc
-  for ep in "${endpoints[@]}"; do
-    portainer_try_init "$ep"; rc=$?
-    [[ "$rc" == "0" ]] && break
-  done
-
-  # Revalida login
-  if with_retries 10 2 portainer_try_auth; then
-    ok "Bootstrap do Portainer concluído e login validado."
-    return 0
-  fi
-
-  warn "Bootstrap automático não conseguiu validar login (Portainer latest pode ter mudado o fluxo)."
-  info "Coletando diagnóstico no log..."
-  sudo docker service ps portainer_portainer || true
-  sudo docker service logs -n 200 portainer_portainer || true
-  sudo docker service logs -n 200 traefik_traefik || true
-
-  warn "Fallback: finalize pela UI em https://${URL_PORTAINER} (primeiro acesso)."
+  for ep in "${endpoints[@]}"; do portainer_try_init "$ep"; rc=$?; [[ "$rc" == "0" ]] && break; done
+  if with_retries 10 2 portainer_try_auth; then ok "Bootstrap do Portainer concluído."; return 0; fi
+  warn "Bootstrap automático não conseguiu validar login. Faça pela UI: https://${URL_PORTAINER}"
   return 1
 }
 
@@ -599,10 +505,7 @@ main() {
   mkdir -p "$(dirname "$LOG_FILE")"
   exec > >(tee -a "$LOG_FILE") 2>&1
 
-  if (( DEBUG )); then
-    set -x
-    warn "Modo --debug habilitado."
-  fi
+  if (( DEBUG )); then set -x; warn "Modo --debug habilitado."; fi
 
   echo -e "${BOLD}${WHITE}${TITLE}${RESET}"
   info "Log: $LOG_FILE"
@@ -614,16 +517,13 @@ main() {
   need_sudo
   install_dependencies
   apt_setup_retries
-
   configure_needrestart_noninteractive
 
   acquire_lock
   state_init
 
-  # Auto-start via curl -> clone -> reexec no repo
   ensure_repo_and_reexec
 
-  # A partir daqui, já rodando do repo
   if [[ -z "$(state_get inputs_ok)" ]]; then
     prompt_inputs
     write_env_file
@@ -692,8 +592,7 @@ main() {
   ok "Instalação finalizada."
   info "Portainer: https://${URL_PORTAINER}"
   info "State file: $STATE_FILE"
-
-  kernel_reboot_hint
+  warn "Kernel updates estão em HOLD para evitar interrupções. Para liberar no futuro: sudo apt-mark unhold linux-image-oracle linux-headers-oracle linux-oracle"
 }
 
 main "$@"
