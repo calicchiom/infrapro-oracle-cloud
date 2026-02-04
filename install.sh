@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
+# ===== Non-interactive / no UI (evita travar em prompts como needrestart) =====
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a       # a=auto (não abre UI)
+export NEEDRESTART_SUSPEND=1    # suspende prompts do needrestart durante o apt
+export UCF_FORCE_CONFFOLD=1
+
 trap 'echo -e "\n❌ ERRO: Falha na linha $LINENO. Comando: $BASH_COMMAND" >&2' ERR
 
-TITLE="InfraPro Cloud Oracle - criado por Márcio Calicchio - v1.1.1"
+TITLE="InfraPro Cloud Oracle - criado por Márcio Calicchio - v1.1.2"
 
 LOG_FILE="$HOME/infrapro-install.log"
 LOCK_FILE="$HOME/.infrapro.lock"
@@ -36,6 +43,28 @@ Auto-start via curl:
   curl -fsSL https://raw.githubusercontent.com/calicchiom/infrapro-oracle-cloud/main/install.sh | bash
   curl -fsSL https://raw.githubusercontent.com/calicchiom/infrapro-oracle-cloud/main/install.sh | bash -s -- --debug
 EOF
+}
+
+# ---------------- Args (FIX curl|bash + args vazios) ----------------
+parse_args() {
+  # robusto para:
+  # - ./install.sh --debug
+  # - curl ... | bash
+  # - curl ... | bash -s -- --debug
+  while (( $# )); do
+    # ignora argumentos vazios
+    if [[ -z "${1:-}" ]]; then
+      shift
+      continue
+    fi
+
+    case "$1" in
+      --debug) DEBUG=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; break ;;
+      *) err "Argumento desconhecido: $1"; usage; exit 1 ;;
+    esac
+  done
 }
 
 # ---------------- Utils ----------------
@@ -91,14 +120,35 @@ with_retries() { # <retries> <delay> -- cmd...
   done
 }
 
+# ---------------- APT non-interactive helpers ----------------
+APT_OPTS=(
+  -y
+  -o Dpkg::Options::="--force-confdef"
+  -o Dpkg::Options::="--force-confold"
+  -o APT::Get::Assume-Yes=true
+)
+
+apt_update() { sudo apt-get update "${APT_OPTS[@]}"; }
+apt_install() { sudo apt-get install "${APT_OPTS[@]}" "$@"; }
+apt_upgrade() { sudo apt-get upgrade "${APT_OPTS[@]}"; }
+
+# Evita prompt do grub/bootloader em alguns cenários
+preseed_grub() {
+  if command -v debconf-set-selections >/dev/null 2>&1; then
+    echo 'grub-pc grub-pc/install_devices_empty boolean true' | sudo debconf-set-selections || true
+    echo 'grub-pc grub-pc/install_devices multiselect' | sudo debconf-set-selections || true
+  fi
+}
+
 apt_install_if_missing() {
   local to_install=()
   for pkg in "$@"; do
     dpkg -s "$pkg" >/dev/null 2>&1 || to_install+=("$pkg")
   done
   if ((${#to_install[@]})); then
-    sudo apt update
-    sudo apt install -y "${to_install[@]}"
+    preseed_grub
+    apt_update
+    apt_install "${to_install[@]}"
   fi
 }
 
@@ -106,6 +156,35 @@ apt_setup_retries() {
   sudo tee /etc/apt/apt.conf.d/80infrapro-retries >/dev/null <<'EOF'
 Acquire::Retries "3";
 EOF
+}
+
+configure_needrestart_noninteractive() {
+  # Mantém a função do needrestart, mas impede UI interativa que trava o script.
+  step "Configurando needrestart para modo não-interativo (evita popup de kernel)"
+  sudo mkdir -p /etc/needrestart/conf.d
+  sudo tee /etc/needrestart/conf.d/99-infrapro.conf >/dev/null <<'EOF'
+# InfraPro: não abrir UI interativa em upgrades
+$nrconf{restart} = 'a';      # a=automatic, l=list only, i=interactive
+$nrconf{kernelhints} = 0;    # não mostrar tela de kernel pendente
+EOF
+  ok "needrestart configurado."
+}
+
+kernel_reboot_hint() {
+  # Melhor esforço: detecta se um reboot é recomendado (sem interromper)
+  local running expected
+  running="$(uname -r 2>/dev/null || true)"
+  expected="$(dpkg-query -W -f='${Version}\n' "linux-image-$(uname -r)" 2>/dev/null || true)"
+
+  # Heurística simples: se há pacote de kernel mais novo instalado do que o em execução,
+  # o needrestart avisaria. A forma mais confiável é checar /var/run/reboot-required.
+  if [[ -f /var/run/reboot-required ]]; then
+    warn "Reboot recomendado (arquivo /var/run/reboot-required detectado)."
+    info "Quando possível, rode: sudo reboot"
+  fi
+
+  # Apenas log extra (não crítico)
+  info "Kernel em execução: ${running}"
 }
 
 # ---------------- Lock ----------------
@@ -125,7 +204,7 @@ state_init() {
   if [[ ! -f "$STATE_FILE" ]]; then
     cat >"$STATE_FILE" <<'JSON'
 {
-  "version": "1.1.1",
+  "version": "1.1.2",
   "checkpoints": {}
 }
 JSON
@@ -293,7 +372,7 @@ copy_and_render_yamls() {
 # ---------------- Dependencies ----------------
 install_dependencies() {
   step "Instalando dependências essenciais"
-  apt_install_if_missing curl wget git ca-certificates gnupg lsb-release apt-transport-https software-properties-common dnsutils jq unzip net-tools htop tree vim nano gettext-base util-linux
+  apt_install_if_missing curl wget git ca-certificates gnupg lsb-release apt-transport-https software-properties-common dnsutils jq unzip net-tools htop tree vim nano gettext-base util-linux debconf-utils needrestart
   local cmds=(curl wget git gpg lsb_release dig jq unzip netstat envsubst flock)
   for c in "${cmds[@]}"; do require_cmd "$c"; done
   ok "Dependências OK."
@@ -328,9 +407,12 @@ remove_unattended_upgrades_pkg() {
 }
 
 update_upgrade_and_apparmor() {
-  step "FASE 1.3 — Update/upgrade + apparmor-utils"
-  sudo apt update && sudo apt upgrade -y && sudo apt install apparmor-utils -y
-  ok "Sistema atualizado + apparmor-utils."
+  step "FASE 1.3 — Update/upgrade (non-interactive) + apparmor-utils"
+  preseed_grub
+  apt_update
+  apt_upgrade
+  apt_install apparmor-utils
+  ok "Sistema atualizado (non-interactive) + apparmor-utils."
 }
 
 configure_ufw() {
@@ -351,8 +433,8 @@ install_docker() {
     curlx https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
     echo "deb [arch=arm64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
       | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
-    sudo apt update
-    sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    apt_update
+    apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     ok "Docker instalado."
   else
     ok "Docker já instalado."
@@ -511,28 +593,6 @@ bootstrap_portainer_admin() {
   return 1
 }
 
-# ---------------- Args (FIX curl|bash) ----------------
-parse_args() {
-  # Robustez para:
-  # - ./install.sh --debug
-  # - bash -s -- --debug
-  # - curl ... | bash  (às vezes chega argumento vazio)
-  while (( $# )); do
-    # ignora argumentos vazios
-    if [[ -z "${1:-}" ]]; then
-      shift
-      continue
-    fi
-
-    case "$1" in
-      --debug) DEBUG=1; shift ;;
-      -h|--help) usage; exit 0 ;;
-      --) shift; break ;;  # fim dos args
-      *) err "Argumento desconhecido: $1"; usage; exit 1 ;;
-    esac
-  done
-}
-
 main() {
   parse_args "$@"
 
@@ -554,6 +614,8 @@ main() {
   need_sudo
   install_dependencies
   apt_setup_retries
+
+  configure_needrestart_noninteractive
 
   acquire_lock
   state_init
@@ -630,6 +692,8 @@ main() {
   ok "Instalação finalizada."
   info "Portainer: https://${URL_PORTAINER}"
   info "State file: $STATE_FILE"
+
+  kernel_reboot_hint
 }
 
 main "$@"
