@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 trap 'echo -e "\n❌ ERRO: Falha na linha $LINENO. Comando: $BASH_COMMAND" >&2' ERR
 
-TITLE="InfraPro Cloud Oracle - criado por Márcio Calicchio - v1.1.0"
+TITLE="InfraPro Cloud Oracle - criado por Márcio Calicchio - v1.1.1"
 
 LOG_FILE="$HOME/infrapro-install.log"
 LOCK_FILE="$HOME/.infrapro.lock"
@@ -125,7 +125,7 @@ state_init() {
   if [[ ! -f "$STATE_FILE" ]]; then
     cat >"$STATE_FILE" <<'JSON'
 {
-  "version": "1.1.0",
+  "version": "1.1.1",
   "checkpoints": {}
 }
 JSON
@@ -240,7 +240,11 @@ ensure_repo_and_reexec() {
     [[ -f "$REPO_DIR/uninstall.sh" ]] && chmod +x "$REPO_DIR/uninstall.sh" || true
 
     step "Reexecutando automaticamente a partir do repositório..."
-    INFRAPRO_CLONED=1 exec "$REPO_DIR/install.sh" ${DEBUG:+--debug}
+    if (( DEBUG )); then
+      INFRAPRO_CLONED=1 exec "$REPO_DIR/install.sh" --debug
+    else
+      INFRAPRO_CLONED=1 exec "$REPO_DIR/install.sh"
+    fi
   fi
 }
 
@@ -507,14 +511,30 @@ bootstrap_portainer_admin() {
   return 1
 }
 
-main() {
-  for arg in "${@:-}"; do
-    case "$arg" in
-      --debug) DEBUG=1 ;;
+# ---------------- Args (FIX curl|bash) ----------------
+parse_args() {
+  # Robustez para:
+  # - ./install.sh --debug
+  # - bash -s -- --debug
+  # - curl ... | bash  (às vezes chega argumento vazio)
+  while (( $# )); do
+    # ignora argumentos vazios
+    if [[ -z "${1:-}" ]]; then
+      shift
+      continue
+    fi
+
+    case "$1" in
+      --debug) DEBUG=1; shift ;;
       -h|--help) usage; exit 0 ;;
-      *) err "Argumento desconhecido: $arg"; usage; exit 1 ;;
+      --) shift; break ;;  # fim dos args
+      *) err "Argumento desconhecido: $1"; usage; exit 1 ;;
     esac
   done
+}
+
+main() {
+  parse_args "$@"
 
   mkdir -p "$(dirname "$LOG_FILE")"
   exec > >(tee -a "$LOG_FILE") 2>&1
