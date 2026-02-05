@@ -30,9 +30,15 @@ REPO_URL="https://github.com/calicchiom/infrapro-oracle-cloud"
 REPO_DIR="infrapro-oracle-cloud"
 LOG_FILE="$HOME/infrapro-install.log"
 ENV_FILE="$HOME/.infrapro.env"
-BOOTSTRAP_FLAG="$HOME/.infrapro-bootstrap-done"
 DEBUG_MODE=false
-CONTINUE_MODE=false
+IS_PIPED=false
+
+#---------------------------------------
+# Detectar se está rodando via pipe (curl | bash)
+#---------------------------------------
+if [[ ! -t 0 ]]; then
+    IS_PIPED=true
+fi
 
 #---------------------------------------
 # Cores
@@ -55,21 +61,12 @@ for arg in "$@"; do
             DEBUG_MODE=true
             shift
             ;;
-        --continue)
-            CONTINUE_MODE=true
-            shift
-            ;;
     esac
 done
 
 if [[ "$DEBUG_MODE" == true ]]; then
     set -x
 fi
-
-#---------------------------------------
-# Inicializar log
-#---------------------------------------
-exec > >(tee -a "$LOG_FILE") 2>&1
 
 #---------------------------------------
 # Funções de log
@@ -114,25 +111,13 @@ is_inside_repo() {
 }
 
 #---------------------------------------
-# Bootstrap: clonar repo e re-executar
+# Bootstrap: quando executado via curl | bash
 #---------------------------------------
-bootstrap() {
-    if [[ "$CONTINUE_MODE" == true ]]; then
-        return 0
-    fi
-
-    if is_inside_repo; then
-        log_info "Já está dentro do repositório clonado"
-        return 0
-    fi
-
-    if [[ -f "$BOOTSTRAP_FLAG" ]]; then
-        log_error "Bootstrap já foi executado mas não está no diretório correto"
-        log_info "Execute: cd ~/$REPO_DIR && ./install.sh --continue"
-        exit 1
-    fi
-
-    log_progress "Iniciando bootstrap - clonando repositório..."
+bootstrap_from_curl() {
+    show_banner
+    
+    log_info "Detectado execução via curl | bash"
+    log_progress "Baixando repositório e preparando instalação..."
 
     # Instalar git se necessário
     if ! command -v git &> /dev/null; then
@@ -143,7 +128,7 @@ bootstrap() {
 
     # Remover diretório existente se houver
     if [[ -d "$HOME/$REPO_DIR" ]]; then
-        log_warning "Removendo diretório existente: $HOME/$REPO_DIR"
+        log_warning "Removendo instalação anterior: $HOME/$REPO_DIR"
         rm -rf "$HOME/$REPO_DIR"
     fi
 
@@ -166,19 +151,21 @@ bootstrap() {
     chmod +x "$HOME/$REPO_DIR/install.sh"
     chmod +x "$HOME/$REPO_DIR/uninstall.sh" 2>/dev/null || true
 
-    # Marcar bootstrap como concluído
-    touch "$BOOTSTRAP_FLAG"
-
     log_success "Repositório clonado com sucesso!"
-    log_progress "Re-executando instalação do repositório clonado..."
-
-    # Re-executar do diretório clonado
-    cd "$HOME/$REPO_DIR"
+    echo ""
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "${YELLOW}${BOLD}PRÓXIMO PASSO:${NC}"
+    echo ""
+    echo -e "Execute os comandos abaixo para iniciar a instalação:"
+    echo ""
+    echo -e "   ${CYAN}${BOLD}cd ~/$REPO_DIR${NC}"
+    echo -e "   ${CYAN}${BOLD}./install.sh${NC}"
+    echo ""
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
     
-    ARGS="--continue"
-    [[ "$DEBUG_MODE" == true ]] && ARGS="$ARGS --debug"
-    
-    exec ./install.sh $ARGS
+    exit 0
 }
 
 #---------------------------------------
@@ -510,6 +497,13 @@ EOF
 }
 
 #---------------------------------------
+# Inicializar log (após bootstrap)
+#---------------------------------------
+init_log() {
+    exec > >(tee -a "$LOG_FILE") 2>&1
+}
+
+#---------------------------------------
 # FASE 1.1 - Desabilitar atualizações automáticas
 #---------------------------------------
 phase1_disable_auto_updates() {
@@ -765,28 +759,31 @@ create_docker_secrets() {
 prepare_yaml_files() {
     log_progress "Preparando arquivos YAML..."
 
+    # Diretório do script
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
     # Copiar traefik.yml para HOME
-    if [[ -f "./traefik.yml" ]]; then
-        cp ./traefik.yml "$HOME/traefik.yml"
+    if [[ -f "$SCRIPT_DIR/traefik.yml" ]]; then
+        cp "$SCRIPT_DIR/traefik.yml" "$HOME/traefik.yml"
         # Substituir variáveis
         sed -i "s|\${SSL_EMAIL}|$SSL_EMAIL|g" "$HOME/traefik.yml"
         sed -i "s|\${TRAEFIK_URL}|$TRAEFIK_URL|g" "$HOME/traefik.yml"
         sed -i "s|\${OVERLAY_NETWORK}|$OVERLAY_NETWORK|g" "$HOME/traefik.yml"
         log_success "traefik.yml copiado e configurado"
     else
-        log_error "traefik.yml não encontrado!"
+        log_error "traefik.yml não encontrado em $SCRIPT_DIR!"
         exit 1
     fi
 
     # Copiar portainer.yml para HOME
-    if [[ -f "./portainer.yml" ]]; then
-        cp ./portainer.yml "$HOME/portainer.yml"
+    if [[ -f "$SCRIPT_DIR/portainer.yml" ]]; then
+        cp "$SCRIPT_DIR/portainer.yml" "$HOME/portainer.yml"
         # Substituir variáveis
         sed -i "s|\${PORTAINER_URL}|$PORTAINER_URL|g" "$HOME/portainer.yml"
         sed -i "s|\${OVERLAY_NETWORK}|$OVERLAY_NETWORK|g" "$HOME/portainer.yml"
         log_success "portainer.yml copiado e configurado"
     else
-        log_error "portainer.yml não encontrado!"
+        log_error "portainer.yml não encontrado em $SCRIPT_DIR!"
         exit 1
     fi
 }
@@ -1104,7 +1101,7 @@ show_summary() {
     echo -e "${YELLOW}Portainer:${NC}"
     echo -e "   URL: ${BOLD}https://${PORTAINER_URL}${NC}"
     echo -e "   Usuário: ${BOLD}${PORTAINER_USER}${NC}"
-    echo -e "   (Configure a senha no primeiro acesso ou via API)"
+    echo -e "   (Configure a senha no primeiro acesso)"
     echo ""
 
     echo -e "${YELLOW}Traefik Dashboard:${NC}"
@@ -1157,10 +1154,23 @@ show_summary() {
 # Main
 #---------------------------------------
 main() {
-    show_banner
+    # Se executado via pipe (curl | bash), apenas clonar e orientar
+    if [[ "$IS_PIPED" == true ]]; then
+        bootstrap_from_curl
+        exit 0
+    fi
 
-    # Bootstrap (clonar repo se necessário)
-    bootstrap
+    # Verificar se está dentro do repo
+    if ! is_inside_repo; then
+        log_error "Execute este script de dentro do diretório do repositório clonado!"
+        log_info "Use: cd ~/$REPO_DIR && ./install.sh"
+        exit 1
+    fi
+
+    show_banner
+    
+    # Inicializar log
+    init_log
 
     # Verificações iniciais
     check_architecture
@@ -1213,9 +1223,6 @@ main() {
 
     # Resumo final
     show_summary
-
-    # Limpar flag de bootstrap
-    rm -f "$BOOTSTRAP_FLAG"
 
     log_success "Instalação finalizada!"
 }
