@@ -1,1052 +1,881 @@
 #!/usr/bin/env bash
 #===============================================================================
-# InfraPro Cloud Oracle - Instalação Automatizada
-# Versão: 1.0.0
-# Autor: Márcio Calicchio
+# InfraPro Cloud Oracle - criado por Márcio Calicchio
+# Version: 1.3.0
 # Ambiente: Oracle Cloud ARM64 (aarch64) + Ubuntu Server 24.04
-#
-# USO:
-#   curl -fsSL https://raw.githubusercontent.com/calicchiom/infrapro-oracle-cloud/main/install.sh | bash
-#   ou
-#   ./install.sh [--debug] [--from-bootstrap]
-#
-# REQUISITOS:
-#   - Ubuntu 24.04 ARM64
-#   - Usuário com sudo
-#   - Conexão à internet
 #===============================================================================
 
 set -Eeuo pipefail
 
-#===============================================================================
-# CONFIGURAÇÕES GLOBAIS - EXECUÇÃO NÃO-INTERATIVA
-#===============================================================================
+#---------------------------------------
+# Trap para erros
+#---------------------------------------
+trap 'echo -e "\n❌ ERRO: Falha na linha $LINENO. Comando: $BASH_COMMAND" >&2; exit 1' ERR
+
+#---------------------------------------
+# Variáveis de ambiente para não-interativo
+#---------------------------------------
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export NEEDRESTART_SUSPEND=1
-export UCF_FORCE_CONFFNEW=1
-export LANG=C.UTF-8
-export LC_ALL=C.UTF-8
+export UCF_FORCE_CONFNEW=1
 
-# Opções APT padrão para evitar QUALQUER interação
-APT_OPTS=(
-    -y
-    -o Dpkg::Options::="--force-confnew"
-    -o Dpkg::Options::="--force-confdef"
-    -o APT::Get::Assume-Yes=true
-    -o APT::Get::AllowUnauthenticated=false
-    -o Dpkg::Use-Pty=0
-)
-
-#===============================================================================
-# VARIÁVEIS GLOBAIS
-#===============================================================================
-readonly VERSION="1.0.0"
-readonly SCRIPT_NAME="InfraPro Cloud Oracle"
-readonly AUTHOR="Márcio Calicchio"
-readonly LOG_FILE="$HOME/infrapro-install.log"
-readonly ENV_FILE="$HOME/.infrapro.env"
-readonly REPO_URL="https://github.com/calicchiom/infrapro-oracle-cloud"
-readonly REPO_DIR="$HOME/infrapro-oracle-cloud"
-
-# Flags
+#---------------------------------------
+# Constantes
+#---------------------------------------
+SCRIPT_VERSION="1.3.0"
+SCRIPT_NAME="InfraPro Cloud Oracle"
+SCRIPT_AUTHOR="Márcio Calicchio"
+REPO_URL="https://github.com/calicchiom/infrapro-oracle-cloud"
+REPO_DIR="infrapro-oracle-cloud"
+LOG_FILE="$HOME/infrapro-install.log"
+ENV_FILE="$HOME/.infrapro.env"
+BOOTSTRAP_FLAG="$HOME/.infrapro-bootstrap-done"
 DEBUG_MODE=false
-FROM_BOOTSTRAP=false
-INSIDE_REPO=false
-REBOOT_RECOMMENDED=false
+CONTINUE_MODE=false
 
-# Variáveis de input (preenchidas durante execução)
-PORTAINER_URL=""
-PORTAINER_ADMIN_USER=""
-PORTAINER_ADMIN_PASS=""
-OVERLAY_NETWORK_NAME=""
-SSL_EMAIL=""
-POSTGRES_PASSWORD=""
-LOCAL_IP=""
-PUBLIC_IP=""
+#---------------------------------------
+# Cores
+#---------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m'
+BOLD='\033[1m'
 
-#===============================================================================
-# TRAP E TRATAMENTO DE ERROS
-#===============================================================================
-cleanup() {
-    local exit_code=$?
-    if [[ $exit_code -ne 0 ]]; then
-        log_error "Script interrompido com código de saída: $exit_code"
-        log_error "Verifique o log em: $LOG_FILE"
+#---------------------------------------
+# Parse argumentos
+#---------------------------------------
+for arg in "$@"; do
+    case $arg in
+        --debug)
+            DEBUG_MODE=true
+            shift
+            ;;
+        --continue)
+            CONTINUE_MODE=true
+            shift
+            ;;
+    esac
+done
+
+if [[ "$DEBUG_MODE" == true ]]; then
+    set -x
+fi
+
+#---------------------------------------
+# Inicializar log
+#---------------------------------------
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+#---------------------------------------
+# Funções de log
+#---------------------------------------
+timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
+log_info() { echo -e "$(timestamp) ${BLUE}📋 [INFO]${NC} $1"; }
+log_success() { echo -e "$(timestamp) ${GREEN}✅ [SUCCESS]${NC} $1"; }
+log_warning() { echo -e "$(timestamp) ${YELLOW}⚠️  [WARNING]${NC} $1"; }
+log_error() { echo -e "$(timestamp) ${RED}❌ [ERROR]${NC} $1"; }
+log_progress() { echo -e "$(timestamp) ${MAGENTA}🔄 [PROGRESS]${NC} $1"; }
+
+#---------------------------------------
+# Banner
+#---------------------------------------
+show_banner() {
+    clear
+    echo -e "${CYAN}${BOLD}"
+    cat << 'EOF'
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                                                                           ║
+║   ██╗███╗   ██╗███████╗██████╗  █████╗ ██████╗ ██████╗  ██████╗           ║
+║   ██║████╗  ██║██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔══██╗██╔═══██╗          ║
+║   ██║██╔██╗ ██║█████╗  ██████╔╝███████║██████╔╝██████╔╝██║   ██║          ║
+║   ██║██║╚██╗██║██╔══╝  ██╔══██╗██╔══██║██╔═══╝ ██╔══██╗██║   ██║          ║
+║   ██║██║ ╚████║██║     ██║  ██║██║  ██║██║     ██║  ██║╚██████╔╝          ║
+║   ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝ ╚═════╝           ║
+║                                                                           ║
+║                    Cloud Oracle Infrastructure                            ║
+║                                                                           ║
+║              Criado por: Márcio Calicchio - Versão 1.3.0                  ║
+║                                                                           ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+EOF
+    echo -e "${NC}"
+}
+
+#---------------------------------------
+# Verificar se está rodando dentro do repo clonado
+#---------------------------------------
+is_inside_repo() {
+    [[ -f "./traefik.yml" ]] && [[ -f "./portainer.yml" ]] && [[ -f "./install.sh" ]]
+}
+
+#---------------------------------------
+# Bootstrap: clonar repo e re-executar
+#---------------------------------------
+bootstrap() {
+    if [[ "$CONTINUE_MODE" == true ]]; then
+        return 0
     fi
-}
 
-trap 'echo -e "\n❌ ERRO: Falha na linha $LINENO. Comando: $BASH_COMMAND" >&2; cleanup' ERR
-trap cleanup EXIT
-
-#===============================================================================
-# FUNÇÕES DE LOG
-#===============================================================================
-log_init() {
-    mkdir -p "$(dirname "$LOG_FILE")"
-    exec > >(tee -a "$LOG_FILE") 2>&1
-    echo ""
-    echo "==============================================================================="
-    echo "Log iniciado em: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "==============================================================================="
-}
-
-log_timestamp() {
-    date '+%Y-%m-%d %H:%M:%S'
-}
-
-log_info() {
-    echo -e "[$(log_timestamp)] 📋 INFO: $*"
-}
-
-log_success() {
-    echo -e "[$(log_timestamp)] ✅ SUCESSO: $*"
-}
-
-log_warning() {
-    echo -e "[$(log_timestamp)] ⚠️  AVISO: $*"
-}
-
-log_error() {
-    echo -e "[$(log_timestamp)] ❌ ERRO: $*" >&2
-}
-
-log_progress() {
-    echo -e "[$(log_timestamp)] 🔄 PROGRESSO: $*"
-}
-
-log_section() {
-    echo ""
-    echo "==============================================================================="
-    echo "  $*"
-    echo "==============================================================================="
-    echo ""
-}
-
-print_banner() {
-    echo ""
-    echo "╔═══════════════════════════════════════════════════════════════════════════════╗"
-    echo "║                                                                               ║"
-    echo "║   ██╗███╗   ██╗███████╗██████╗  █████╗ ██████╗ ██████╗  ██████╗               ║"
-    echo "║   ██║████╗  ██║██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔══██╗██╔═══██╗              ║"
-    echo "║   ██║██╔██╗ ██║█████╗  ██████╔╝███████║██████╔╝██████╔╝██║   ██║              ║"
-    echo "║   ██║██║╚██╗██║██╔══╝  ██╔══██╗██╔══██║██╔═══╝ ██╔══██╗██║   ██║              ║"
-    echo "║   ██║██║ ╚████║██║     ██║  ██║██║  ██║██║     ██║  ██║╚██████╔╝              ║"
-    echo "║   ╚═╝╚═╝  ╚═══╝╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝ ╚═════╝               ║"
-    echo "║                                                                               ║"
-    echo "║                        Cloud Oracle - ARM64 Edition                           ║"
-    echo "║                                                                               ║"
-    echo "║   Criado por: $AUTHOR                                              ║"
-    echo "║   Versão: $VERSION                                                            ║"
-    echo "║                                                                               ║"
-    echo "╚═══════════════════════════════════════════════════════════════════════════════╝"
-    echo ""
-}
-
-#===============================================================================
-# FUNÇÕES AUXILIARES
-#===============================================================================
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --debug)
-                DEBUG_MODE=true
-                shift
-                ;;
-            --from-bootstrap)
-                FROM_BOOTSTRAP=true
-                shift
-                ;;
-            *)
-                log_warning "Argumento desconhecido: $1"
-                shift
-                ;;
-        esac
-    done
-    
-    if [[ "$DEBUG_MODE" == true ]]; then
-        set -x
-        log_info "Modo debug ativado"
+    if is_inside_repo; then
+        log_info "Já está dentro do repositório clonado"
+        return 0
     fi
-}
 
-check_inside_repo() {
-    # Detecta se estamos dentro do repositório clonado
-    if [[ -f "./traefik.yml" && -f "./portainer.yml" && -f "./uninstall.sh" ]]; then
-        INSIDE_REPO=true
-    fi
-}
-
-check_root() {
-    if [[ $EUID -eq 0 ]]; then
-        log_error "Este script NÃO deve ser executado como root."
-        log_error "Execute como usuário normal com privilégios sudo."
+    if [[ -f "$BOOTSTRAP_FLAG" ]]; then
+        log_error "Bootstrap já foi executado mas não está no diretório correto"
+        log_info "Execute: cd ~/$REPO_DIR && ./install.sh --continue"
         exit 1
     fi
-    
-    if ! sudo -v &>/dev/null; then
-        log_error "Usuário não possui privilégios sudo."
+
+    log_progress "Iniciando bootstrap - clonando repositório..."
+
+    # Instalar git se necessário
+    if ! command -v git &> /dev/null; then
+        log_info "Instalando git..."
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq git
+    fi
+
+    # Remover diretório existente se houver
+    if [[ -d "$HOME/$REPO_DIR" ]]; then
+        log_warning "Removendo diretório existente: $HOME/$REPO_DIR"
+        rm -rf "$HOME/$REPO_DIR"
+    fi
+
+    # Clonar repositório
+    cd "$HOME"
+    git clone "$REPO_URL" "$REPO_DIR"
+
+    # Validar arquivos essenciais
+    if [[ ! -f "$HOME/$REPO_DIR/traefik.yml" ]]; then
+        log_error "Arquivo traefik.yml não encontrado no repositório!"
         exit 1
     fi
+
+    if [[ ! -f "$HOME/$REPO_DIR/portainer.yml" ]]; then
+        log_error "Arquivo portainer.yml não encontrado no repositório!"
+        exit 1
+    fi
+
+    # Tornar scripts executáveis
+    chmod +x "$HOME/$REPO_DIR/install.sh"
+    chmod +x "$HOME/$REPO_DIR/uninstall.sh" 2>/dev/null || true
+
+    # Marcar bootstrap como concluído
+    touch "$BOOTSTRAP_FLAG"
+
+    log_success "Repositório clonado com sucesso!"
+    log_progress "Re-executando instalação do repositório clonado..."
+
+    # Re-executar do diretório clonado
+    cd "$HOME/$REPO_DIR"
     
-    log_success "Verificação de privilégios: OK"
+    ARGS="--continue"
+    [[ "$DEBUG_MODE" == true ]] && ARGS="$ARGS --debug"
+    
+    exec ./install.sh $ARGS
 }
 
+#---------------------------------------
+# Verificar arquitetura ARM64
+#---------------------------------------
 check_architecture() {
-    local arch
-    arch=$(uname -m)
+    log_progress "Verificando arquitetura..."
     
-    if [[ "$arch" != "aarch64" ]]; then
-        log_error "Arquitetura não suportada: $arch"
-        log_error "Este script requer ARM64 (aarch64)"
-        exit 1
-    fi
-    
-    log_success "Arquitetura ARM64 (aarch64): OK"
-}
-
-check_ubuntu_version() {
-    if [[ ! -f /etc/os-release ]]; then
-        log_error "Arquivo /etc/os-release não encontrado"
-        exit 1
-    fi
-    
-    source /etc/os-release
-    
-    if [[ "$ID" != "ubuntu" ]]; then
-        log_error "Sistema operacional não suportado: $ID"
-        log_error "Este script requer Ubuntu"
-        exit 1
-    fi
-    
-    if [[ "${VERSION_ID}" != "24.04" ]]; then
-        log_warning "Versão do Ubuntu: $VERSION_ID (esperado: 24.04)"
-        log_warning "O script pode funcionar, mas não foi testado nesta versão"
+    ARCH=$(uname -m)
+    if [[ "$ARCH" != "aarch64" ]]; then
+        log_warning "Arquitetura detectada: $ARCH (esperado: aarch64)"
+        log_warning "O script foi otimizado para ARM64, mas tentará continuar..."
     else
-        log_success "Ubuntu 24.04: OK"
+        log_success "Arquitetura ARM64 (aarch64) confirmada"
     fi
 }
 
-check_internet() {
-    log_progress "Verificando conectividade com a internet..."
+#---------------------------------------
+# Verificar Ubuntu 24.04
+#---------------------------------------
+check_ubuntu() {
+    log_progress "Verificando sistema operacional..."
     
-    local test_hosts=("google.com" "github.com" "download.docker.com")
-    local success=false
-    
-    for host in "${test_hosts[@]}"; do
-        if ping -c 1 -W 5 "$host" &>/dev/null; then
-            success=true
-            break
-        fi
-    done
-    
-    if [[ "$success" != true ]]; then
-        log_error "Sem conectividade com a internet"
+    if [[ ! -f /etc/os-release ]]; then
+        log_error "Não foi possível detectar o sistema operacional"
         exit 1
     fi
-    
-    log_success "Conectividade com a internet: OK"
-}
 
-get_local_ip() {
-    LOCAL_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo "")
-    
-    if [[ -z "$LOCAL_IP" ]]; then
-        LOCAL_IP=$(hostname -I | awk '{print $1}')
-    fi
-    
-    if [[ -z "$LOCAL_IP" ]]; then
-        log_error "Não foi possível determinar o IP local"
+    source /etc/os-release
+
+    if [[ "$ID" != "ubuntu" ]]; then
+        log_error "Este script requer Ubuntu. Detectado: $ID"
         exit 1
     fi
-    
-    log_info "IP local detectado: $LOCAL_IP"
+
+    if [[ "${VERSION_ID}" != "24.04" ]]; then
+        log_warning "Ubuntu $VERSION_ID detectado. O script foi testado no 24.04"
+    else
+        log_success "Ubuntu 24.04 confirmado"
+    fi
 }
 
-get_public_ip() {
-    log_progress "Obtendo IP público..."
+#---------------------------------------
+# Verificar sudo
+#---------------------------------------
+check_sudo() {
+    log_progress "Verificando permissões sudo..."
     
-    local services=("ifconfig.me" "ipecho.net/plain" "icanhazip.com" "api.ipify.org")
-    
-    for service in "${services[@]}"; do
-        PUBLIC_IP=$(curl -s --connect-timeout 5 "$service" 2>/dev/null | tr -d '[:space:]' || echo "")
-        if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            log_info "IP público detectado: $PUBLIC_IP"
-            return 0
-        fi
-    done
-    
-    log_warning "Não foi possível obter IP público"
-    PUBLIC_IP="N/A"
+    if [[ $EUID -eq 0 ]]; then
+        log_error "Não execute como root! Use um usuário normal com sudo."
+        exit 1
+    fi
+
+    if ! sudo -n true 2>/dev/null; then
+        log_info "Solicitando permissão sudo..."
+        sudo -v
+    fi
+
+    log_success "Permissões sudo confirmadas"
 }
 
-#===============================================================================
-# FUNÇÕES APT COM RETRY E LOCK HANDLING
-#===============================================================================
-wait_for_apt_lock() {
+#---------------------------------------
+# Aguardar liberação do apt/dpkg
+#---------------------------------------
+wait_for_apt() {
     local max_wait=300
-    local wait_time=0
-    
-    while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1 || \
-          fuser /var/lib/apt/lists/lock &>/dev/null 2>&1 || \
-          fuser /var/cache/apt/archives/lock &>/dev/null 2>&1; do
+    local waited=0
+
+    while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+          sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+          sudo fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
         
-        if [[ $wait_time -ge $max_wait ]]; then
-            log_error "Timeout aguardando liberação do lock do APT"
-            return 1
+        if [[ $waited -ge $max_wait ]]; then
+            log_error "Timeout aguardando liberação do apt/dpkg"
+            exit 1
         fi
-        
-        log_warning "APT está bloqueado por outro processo. Aguardando... ($wait_time/$max_wait segundos)"
+
+        log_warning "apt/dpkg em uso, aguardando... ($waited/$max_wait segundos)"
         sleep 5
-        ((wait_time+=5))
+        ((waited+=5))
     done
-    
-    return 0
 }
 
-fix_dpkg_if_needed() {
+#---------------------------------------
+# Recuperar dpkg se necessário
+#---------------------------------------
+recover_dpkg() {
+    log_progress "Verificando estado do dpkg..."
+    
     if sudo dpkg --audit 2>&1 | grep -q .; then
-        log_warning "Detectado dpkg em estado inconsistente. Tentando recuperar..."
-        sudo dpkg --configure -a --force-confnew --force-confdef || {
-            log_error "Falha ao recuperar dpkg"
-            return 1
+        log_warning "dpkg em estado inconsistente, tentando recuperar..."
+        sudo dpkg --configure -a || {
+            log_error "Não foi possível recuperar o dpkg automaticamente"
+            exit 1
         }
         log_success "dpkg recuperado"
     fi
-    return 0
 }
 
+#---------------------------------------
+# Função apt-get segura com retry
+#---------------------------------------
 apt_safe() {
     local cmd="$1"
     shift
+    local packages="$*"
     local max_retries=3
     local retry=0
-    
+
     while [[ $retry -lt $max_retries ]]; do
-        wait_for_apt_lock || return 1
-        fix_dpkg_if_needed || return 1
-        
-        if sudo apt-get "$cmd" "${APT_OPTS[@]}" "$@"; then
+        wait_for_apt
+        recover_dpkg
+
+        if sudo apt-get "$cmd" -y \
+            -o Dpkg::Options::="--force-confnew" \
+            -o Dpkg::Options::="--force-confdef" \
+            -o APT::Get::Assume-Yes="true" \
+            -o APT::Get::AllowUnauthenticated="false" \
+            $packages; then
             return 0
         fi
-        
+
         ((retry++))
-        log_warning "apt-get $cmd falhou. Tentativa $retry de $max_retries"
+        log_warning "apt-get $cmd falhou, tentativa $retry de $max_retries..."
         sleep 5
     done
-    
+
     log_error "apt-get $cmd falhou após $max_retries tentativas"
     return 1
 }
 
-#===============================================================================
-# FUNÇÕES DE VALIDAÇÃO DE INPUT
-#===============================================================================
+#---------------------------------------
+# Validação de hostname (DNS)
+#---------------------------------------
 validate_hostname() {
     local hostname="$1"
     
-    # Remove protocolo se presente
-    hostname="${hostname#http://}"
-    hostname="${hostname#https://}"
-    hostname="${hostname%%/*}"
-    hostname="${hostname%%:*}"
-    
-    # Validação básica de hostname
-    if [[ ! "$hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+    # Validar formato
+    if [[ ! "$hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
         return 1
     fi
-    
-    # Verifica DNS (apenas aviso)
-    if command -v dig &>/dev/null; then
-        if ! dig +short "$hostname" &>/dev/null; then
-            log_warning "DNS para $hostname não resolveu (pode estar correto se ainda não configurado)"
+
+    # Verificar DNS (apenas warning se falhar)
+    if command -v dig &> /dev/null; then
+        if ! dig +short "$hostname" | grep -q .; then
+            log_warning "DNS para $hostname não resolveu (pode ser configurado depois)"
         fi
     fi
-    
-    echo "$hostname"
+
     return 0
 }
 
-validate_username() {
-    local username="$1"
-    
-    if [[ ${#username} -lt 3 ]]; then
-        return 1
-    fi
-    
-    if [[ ! "$username" =~ ^[a-zA-Z][a-zA-Z0-9_]*$ ]]; then
-        return 1
-    fi
-    
-    return 0
-}
-
-validate_password() {
-    local password="$1"
-    
-    if [[ ${#password} -lt 12 ]]; then
-        return 1
-    fi
-    
-    return 0
-}
-
+#---------------------------------------
+# Validação de email
+#---------------------------------------
 validate_email() {
     local email="$1"
+    local regex="^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
     
-    if [[ ! "$email" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
+    if [[ ! "$email" =~ $regex ]]; then
         return 1
     fi
-    
+
+    # Verificar domínio
+    local domain="${email##*@}"
+    if command -v dig &> /dev/null; then
+        if ! dig +short MX "$domain" | grep -q .; then
+            log_warning "Domínio $domain sem registro MX (pode funcionar mesmo assim)"
+        fi
+    fi
+
     return 0
 }
 
-validate_docker_network_name() {
+#---------------------------------------
+# Validação de nome Docker
+#---------------------------------------
+validate_docker_name() {
     local name="$1"
-    
-    if [[ ${#name} -lt 2 || ${#name} -gt 64 ]]; then
-        return 1
-    fi
     
     if [[ ! "$name" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
         return 1
     fi
-    
+
+    if [[ ${#name} -lt 2 ]] || [[ ${#name} -gt 64 ]]; then
+        return 1
+    fi
+
     return 0
 }
 
-#===============================================================================
-# COLETA DE INPUTS
-#===============================================================================
+#---------------------------------------
+# Coletar inputs do usuário
+#---------------------------------------
 collect_inputs() {
-    log_section "COLETA DE INFORMAÇÕES"
-    
-    echo "Por favor, forneça as informações necessárias para a instalação."
-    echo "Todas as senhas devem ter no mínimo 12 caracteres."
+    log_progress "Coletando informações necessárias..."
     echo ""
-    
+
     # URL do Portainer
     while true; do
-        read -rp "📋 URL do Portainer (hostname sem http/https, ex: portainer.exemplo.com): " PORTAINER_URL
-        if validated_url=$(validate_hostname "$PORTAINER_URL"); then
-            PORTAINER_URL="$validated_url"
-            log_success "URL validada: $PORTAINER_URL"
+        read -rp "$(echo -e "${CYAN}Digite o hostname do Portainer (ex: portainer.seudominio.com):${NC} ")" PORTAINER_URL
+        PORTAINER_URL=$(echo "$PORTAINER_URL" | sed 's|^https\?://||' | sed 's|/$||')
+        
+        if validate_hostname "$PORTAINER_URL"; then
+            log_success "Hostname válido: $PORTAINER_URL"
             break
         else
-            log_error "Hostname inválido. Tente novamente."
+            log_error "Hostname inválido. Use formato: portainer.exemplo.com"
         fi
     done
-    
-    # Usuário admin do Portainer
+
+    # Usuário admin Portainer
     while true; do
-        read -rp "📋 Usuário admin do Portainer (mínimo 3 caracteres, alfanumérico): " PORTAINER_ADMIN_USER
-        if validate_username "$PORTAINER_ADMIN_USER"; then
-            log_success "Usuário validado: $PORTAINER_ADMIN_USER"
+        read -rp "$(echo -e "${CYAN}Digite o usuário admin do Portainer (min 3 caracteres):${NC} ")" PORTAINER_USER
+        
+        if [[ "$PORTAINER_USER" =~ ^[a-zA-Z0-9_]{3,}$ ]]; then
+            log_success "Usuário válido: $PORTAINER_USER"
             break
         else
-            log_error "Usuário inválido. Use apenas letras, números e underscore (mínimo 3 caracteres)."
+            log_error "Usuário deve ter mínimo 3 caracteres (alfanumérico e underscore)"
         fi
     done
-    
-    # Senha do Portainer
+
+    # Senha Portainer
     while true; do
-        read -rsp "🔐 Senha do Portainer (mínimo 12 caracteres): " PORTAINER_ADMIN_PASS
+        read -rsp "$(echo -e "${CYAN}Digite a senha do Portainer (min 12 caracteres):${NC} ")" PORTAINER_PASS
         echo ""
-        if ! validate_password "$PORTAINER_ADMIN_PASS"; then
-            log_error "Senha muito curta. Mínimo 12 caracteres."
+        
+        if [[ ${#PORTAINER_PASS} -lt 12 ]]; then
+            log_error "Senha deve ter mínimo 12 caracteres"
             continue
         fi
-        
-        read -rsp "🔐 Confirme a senha do Portainer: " pass_confirm
+
+        read -rsp "$(echo -e "${CYAN}Confirme a senha do Portainer:${NC} ")" PORTAINER_PASS_CONFIRM
         echo ""
-        if [[ "$PORTAINER_ADMIN_PASS" != "$pass_confirm" ]]; then
-            log_error "Senhas não conferem. Tente novamente."
+
+        if [[ "$PORTAINER_PASS" != "$PORTAINER_PASS_CONFIRM" ]]; then
+            log_error "Senhas não conferem"
             continue
         fi
-        
-        log_success "Senha do Portainer validada"
+
+        log_success "Senha do Portainer definida"
         break
     done
-    
+
     # Nome da rede overlay
     while true; do
-        read -rp "📋 Nome da rede overlay Docker (ex: infrapro-network): " OVERLAY_NETWORK_NAME
-        if validate_docker_network_name "$OVERLAY_NETWORK_NAME"; then
-            log_success "Nome da rede validado: $OVERLAY_NETWORK_NAME"
+        read -rp "$(echo -e "${CYAN}Digite o nome da rede overlay (ex: infrapro_network):${NC} ")" OVERLAY_NETWORK
+        
+        if validate_docker_name "$OVERLAY_NETWORK"; then
+            log_success "Nome da rede válido: $OVERLAY_NETWORK"
             break
         else
-            log_error "Nome inválido. Use letras, números, hífens e underscores (2-64 caracteres)."
+            log_error "Nome inválido. Use: letras, números, underscore e hífen (2-64 chars)"
         fi
     done
-    
+
     # Email para SSL
     while true; do
-        read -rp "📧 Email para certificados SSL (Let's Encrypt): " SSL_EMAIL
+        read -rp "$(echo -e "${CYAN}Digite o email para certificados SSL:${NC} ")" SSL_EMAIL
+        
         if validate_email "$SSL_EMAIL"; then
-            log_success "Email validado: $SSL_EMAIL"
+            log_success "Email válido: $SSL_EMAIL"
             break
         else
-            log_error "Email inválido. Tente novamente."
+            log_error "Email inválido"
         fi
     done
-    
-    # Senha do PostgreSQL
+
+    # Senha PostgreSQL
     while true; do
-        read -rsp "🔐 Senha do PostgreSQL (mínimo 12 caracteres): " POSTGRES_PASSWORD
+        read -rsp "$(echo -e "${CYAN}Digite a senha do PostgreSQL (min 12 caracteres):${NC} ")" POSTGRES_PASS
         echo ""
-        if ! validate_password "$POSTGRES_PASSWORD"; then
-            log_error "Senha muito curta. Mínimo 12 caracteres."
+        
+        if [[ ${#POSTGRES_PASS} -lt 12 ]]; then
+            log_error "Senha deve ter mínimo 12 caracteres"
             continue
         fi
-        
-        read -rsp "🔐 Confirme a senha do PostgreSQL: " pass_confirm
+
+        read -rsp "$(echo -e "${CYAN}Confirme a senha do PostgreSQL:${NC} ")" POSTGRES_PASS_CONFIRM
         echo ""
-        if [[ "$POSTGRES_PASSWORD" != "$pass_confirm" ]]; then
-            log_error "Senhas não conferem. Tente novamente."
+
+        if [[ "$POSTGRES_PASS" != "$POSTGRES_PASS_CONFIRM" ]]; then
+            log_error "Senhas não conferem"
             continue
         fi
-        
-        log_success "Senha do PostgreSQL validada"
+
+        log_success "Senha do PostgreSQL definida"
         break
     done
-    
+
+    # Hostname do Traefik
+    while true; do
+        read -rp "$(echo -e "${CYAN}Digite o hostname do Traefik Dashboard (ex: traefik.seudominio.com):${NC} ")" TRAEFIK_URL
+        TRAEFIK_URL=$(echo "$TRAEFIK_URL" | sed 's|^https\?://||' | sed 's|/$||')
+        
+        if validate_hostname "$TRAEFIK_URL"; then
+            log_success "Hostname válido: $TRAEFIK_URL"
+            break
+        else
+            log_error "Hostname inválido"
+        fi
+    done
+
     echo ""
-    log_success "Todas as informações coletadas com sucesso!"
-    
-    # Salvar configurações (sem senhas em texto)
-    save_env_file
+    log_success "Todos os inputs coletados com sucesso!"
 }
 
-save_env_file() {
-    log_progress "Salvando configurações em $ENV_FILE..."
-    
+#---------------------------------------
+# Salvar variáveis em .env seguro
+#---------------------------------------
+save_env() {
+    log_progress "Salvando configurações..."
+
     cat > "$ENV_FILE" << EOF
 # InfraPro Cloud Oracle - Configurações
-# Gerado em: $(date '+%Y-%m-%d %H:%M:%S')
+# Gerado em: $(date)
 # ATENÇÃO: Este arquivo contém informações sensíveis!
 
 PORTAINER_URL=$PORTAINER_URL
-PORTAINER_ADMIN_USER=$PORTAINER_ADMIN_USER
-OVERLAY_NETWORK_NAME=$OVERLAY_NETWORK_NAME
+PORTAINER_USER=$PORTAINER_USER
+OVERLAY_NETWORK=$OVERLAY_NETWORK
 SSL_EMAIL=$SSL_EMAIL
-LOCAL_IP=$LOCAL_IP
-PUBLIC_IP=$PUBLIC_IP
-
-# Senhas são armazenadas em Docker Secrets
-# Não armazene senhas em texto neste arquivo
+TRAEFIK_URL=$TRAEFIK_URL
 EOF
 
     chmod 600 "$ENV_FILE"
     log_success "Configurações salvas em $ENV_FILE (chmod 600)"
 }
 
-#===============================================================================
-# BOOTSTRAP - CLONE DO REPOSITÓRIO
-#===============================================================================
-bootstrap_clone_repo() {
-    log_section "BOOTSTRAP - PREPARAÇÃO DO AMBIENTE"
-    
-    # Verifica se já estamos no repositório
-    if [[ "$INSIDE_REPO" == true ]] || [[ "$FROM_BOOTSTRAP" == true ]]; then
-        log_info "Execução a partir do repositório detectada. Continuando..."
-        return 0
-    fi
-    
-    log_progress "Clonando repositório $REPO_URL..."
-    
-    # Remove diretório existente se houver
-    if [[ -d "$REPO_DIR" ]]; then
-        log_warning "Diretório $REPO_DIR já existe. Atualizando..."
-        cd "$REPO_DIR"
-        git fetch origin
-        git reset --hard origin/main || git reset --hard origin/master
-        cd - > /dev/null
-    else
-        git clone "$REPO_URL" "$REPO_DIR" || {
-            log_error "Falha ao clonar repositório"
-            exit 1
-        }
-    fi
-    
-    # Validar arquivos essenciais
-    local required_files=("install.sh" "uninstall.sh" "traefik.yml" "portainer.yml")
-    for file in "${required_files[@]}"; do
-        if [[ ! -f "$REPO_DIR/$file" ]]; then
-            log_error "Arquivo obrigatório não encontrado: $REPO_DIR/$file"
-            exit 1
-        fi
-    done
-    
-    log_success "Repositório clonado e validado"
-    
-    # Tornar scripts executáveis
-    chmod +x "$REPO_DIR/install.sh"
-    chmod +x "$REPO_DIR/uninstall.sh"
-    
-    # Copiar YAMLs para HOME
-    cp "$REPO_DIR/traefik.yml" "$HOME/traefik.yml"
-    cp "$REPO_DIR/portainer.yml" "$HOME/portainer.yml"
-    log_success "Arquivos YAML copiados para $HOME"
-    
-    # Executar o script do repositório
-    log_progress "Delegando execução para o script do repositório..."
-    
-    cd "$REPO_DIR"
-    
-    local exec_args=("--from-bootstrap")
-    if [[ "$DEBUG_MODE" == true ]]; then
-        exec_args+=("--debug")
-    fi
-    
-    exec ./install.sh "${exec_args[@]}"
-}
+#---------------------------------------
+# FASE 1.1 - Desabilitar atualizações automáticas
+#---------------------------------------
+phase1_disable_auto_updates() {
+    log_progress "FASE 1.1 - Desabilitando atualizações automáticas..."
 
-#===============================================================================
-# FASE 1 - PREPARAÇÃO DO UBUNTU
-#===============================================================================
-phase1_prepare_ubuntu() {
-    log_section "FASE 1 - PREPARAÇÃO DO UBUNTU"
-    
-    # 1.1 Desabilitar atualizações automáticas
-    log_progress "1.1 Desabilitando atualizações automáticas..."
-    
-    # Configura /etc/apt/apt.conf.d/20auto-upgrades
+    # Configurar apt para não atualizar automaticamente
     sudo tee /etc/apt/apt.conf.d/20auto-upgrades > /dev/null << 'EOF'
 APT::Periodic::Update-Package-Lists "0";
+APT::Periodic::Unattended-Upgrade "0";
 APT::Periodic::Download-Upgradeable-Packages "0";
 APT::Periodic::AutocleanInterval "0";
-APT::Periodic::Unattended-Upgrade "0";
 EOF
-    
-    # Configura needrestart para modo automático
-    if [[ -f /etc/needrestart/needrestart.conf ]]; then
-        sudo sed -i "s/#\$nrconf{restart} = 'i';/\$nrconf{restart} = 'a';/" /etc/needrestart/needrestart.conf
-        sudo sed -i "s/\$nrconf{restart} = 'i';/\$nrconf{restart} = 'a';/" /etc/needrestart/needrestart.conf
-    fi
-    
-    # Criar configuração para evitar prompts
-    sudo tee /etc/apt/apt.conf.d/99-infrapro-nointeractive > /dev/null << 'EOF'
-Dpkg::Options {
-   "--force-confdef";
-   "--force-confnew";
-}
-APT::Get::Assume-Yes "true";
-APT::Get::allow-downgrades "true";
-APT::Get::allow-remove-essential "false";
-EOF
-    
-    # Parar serviços de atualização automática
+
+    # Parar e desabilitar serviços
     local services=("unattended-upgrades" "apt-daily.timer" "apt-daily-upgrade.timer" "apt-daily.service" "apt-daily-upgrade.service")
+    
     for service in "${services[@]}"; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
             sudo systemctl stop "$service" 2>/dev/null || true
-            sudo systemctl disable "$service" 2>/dev/null || true
-            log_info "Serviço $service desabilitado"
         fi
+        if systemctl is-enabled --quiet "$service" 2>/dev/null; then
+            sudo systemctl disable "$service" 2>/dev/null || true
+        fi
+        sudo systemctl mask "$service" 2>/dev/null || true
     done
-    
-    # Mascarar serviços para evitar reativação
-    sudo systemctl mask apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
-    
-    log_success "1.1 Atualizações automáticas desabilitadas"
-    
-    # 1.2 Remover unattended-upgrades
-    log_progress "1.2 Removendo unattended-upgrades..."
-    
+
+    log_success "Atualizações automáticas desabilitadas"
+}
+
+#---------------------------------------
+# FASE 1.2 - Remover unattended-upgrades
+#---------------------------------------
+phase1_remove_unattended() {
+    log_progress "FASE 1.2 - Removendo unattended-upgrades..."
+
     if dpkg -l | grep -q unattended-upgrades; then
         apt_safe remove unattended-upgrades
         apt_safe autoremove
-        log_success "1.2 unattended-upgrades removido"
+        log_success "unattended-upgrades removido"
     else
-        log_info "1.2 unattended-upgrades não estava instalado"
+        log_info "unattended-upgrades já não está instalado"
     fi
-    
-    # 1.3 Update e Upgrade do sistema
-    log_progress "1.3 Atualizando sistema (apt update/upgrade)..."
-    
-    apt_safe update
-    apt_safe upgrade
-    
-    # Instalar apparmor-utils
-    apt_safe install apparmor-utils
-    
-    # Verificar se kernel foi atualizado
-    local running_kernel
-    local installed_kernel
-    running_kernel=$(uname -r)
-    installed_kernel=$(dpkg -l | grep -E "^ii\s+linux-image-[0-9]" | tail -1 | awk '{print $2}' | sed 's/linux-image-//' || echo "")
-    
-    if [[ -n "$installed_kernel" && "$running_kernel" != "$installed_kernel" ]]; then
-        REBOOT_RECOMMENDED=true
-        log_warning "Kernel atualizado de $running_kernel para $installed_kernel"
-        log_warning "Reboot recomendado após a conclusão da instalação"
-    fi
-    
-    log_success "1.3 Sistema atualizado"
-    
-    # 1.4 Instalar dependências básicas
-    log_progress "1.4 Instalando dependências básicas..."
-    
-    local packages=(
-        curl wget git ca-certificates gnupg lsb-release apt-transport-https
-        software-properties-common dnsutils jq unzip net-tools htop tree vim nano
-    )
-    
-    apt_safe install "${packages[@]}"
-    
-    log_success "1.4 Dependências instaladas"
-    
-    # 1.5 Configurar UFW
-    log_progress "1.5 Configurando UFW..."
-    
-    if ! command -v ufw &>/dev/null; then
-        apt_safe install ufw
-    fi
-    
-    # Configurar regras padrão
-    sudo ufw default allow outgoing
-    sudo ufw default deny incoming
-    
-    # Permitir SSH (importante!)
-    sudo ufw allow ssh
-    sudo ufw allow 22/tcp
-    
-    # Permitir HTTP e HTTPS
-    sudo ufw allow 80/tcp
-    sudo ufw allow 443/tcp
-    
-    # Habilitar UFW (não-interativo)
-    echo "y" | sudo ufw enable || true
-    
-    log_success "1.5 UFW configurado"
-    sudo ufw status verbose
-    
-    log_success "FASE 1 CONCLUÍDA"
 }
 
-#===============================================================================
-# FASE 2 - DOCKER, SWARM, TRAEFIK, PORTAINER
-#===============================================================================
-phase2_docker_stack() {
-    log_section "FASE 2 - DOCKER, SWARM, TRAEFIK, PORTAINER"
-    
-    # 2.1 Instalar Docker
-    log_progress "2.1 Instalando Docker..."
-    
-    if command -v docker &>/dev/null && sudo docker info &>/dev/null; then
-        local docker_version
-        docker_version=$(docker --version 2>/dev/null || echo "unknown")
-        log_info "Docker já instalado: $docker_version"
+#---------------------------------------
+# FASE 1.3 - Update/Upgrade sistema
+#---------------------------------------
+phase1_update_system() {
+    log_progress "FASE 1.3 - Atualizando sistema..."
+
+    # Configurar needrestart para não perguntar
+    if [[ -f /etc/needrestart/needrestart.conf ]]; then
+        sudo sed -i "s/#\$nrconf{restart} = 'i';/\$nrconf{restart} = 'a';/" /etc/needrestart/needrestart.conf
+    fi
+
+    # Criar configuração para needrestart
+    sudo mkdir -p /etc/needrestart/conf.d/
+    echo "\$nrconf{restart} = 'a';" | sudo tee /etc/needrestart/conf.d/50local.conf > /dev/null
+
+    apt_safe update
+    apt_safe upgrade
+    apt_safe install apparmor-utils
+
+    log_success "Sistema atualizado"
+}
+
+#---------------------------------------
+# FASE 1.4 - Configurar UFW
+#---------------------------------------
+phase1_configure_ufw() {
+    log_progress "FASE 1.4 - Configurando UFW..."
+
+    # Instalar ufw se necessário
+    if ! command -v ufw &> /dev/null; then
+        apt_safe install ufw
+    fi
+
+    # Configurar regras
+    sudo ufw --force reset
+    sudo ufw default allow incoming
+    sudo ufw default allow outgoing
+    sudo ufw default allow routed
+
+    # Regras essenciais
+    sudo ufw allow 22/tcp comment 'SSH'
+    sudo ufw allow 80/tcp comment 'HTTP'
+    sudo ufw allow 443/tcp comment 'HTTPS'
+    sudo ufw allow 9000/tcp comment 'Portainer'
+    sudo ufw allow 9443/tcp comment 'Portainer HTTPS'
+    sudo ufw allow 8080/tcp comment 'Traefik Dashboard'
+    sudo ufw allow 2377/tcp comment 'Docker Swarm'
+    sudo ufw allow 7946/tcp comment 'Docker Swarm'
+    sudo ufw allow 7946/udp comment 'Docker Swarm'
+    sudo ufw allow 4789/udp comment 'Docker Overlay'
+    sudo ufw allow 5432/tcp comment 'PostgreSQL'
+
+    # Habilitar
+    sudo ufw --force enable
+
+    log_success "UFW configurado"
+    sudo ufw status verbose
+}
+
+#---------------------------------------
+# Instalar dependências base
+#---------------------------------------
+install_dependencies() {
+    log_progress "Instalando dependências..."
+
+    apt_safe update
+    apt_safe install curl wget git ca-certificates gnupg lsb-release apt-transport-https \
+        software-properties-common dnsutils jq unzip net-tools htop tree vim nano
+
+    log_success "Dependências instaladas"
+}
+
+#---------------------------------------
+# FASE 2.1 - Docker
+#---------------------------------------
+phase2_docker() {
+    log_progress "FASE 2.1 - Instalando Docker..."
+
+    if command -v docker &> /dev/null; then
+        log_warning "Docker já está instalado"
+        docker --version
     else
         # Remover versões antigas
-        for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do
-            sudo apt-get remove -y "$pkg" 2>/dev/null || true
-        done
-        
-        # Adicionar repositório oficial Docker
+        sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+
+        # Adicionar repositório Docker
         sudo install -m 0755 -d /etc/apt/keyrings
-        
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         sudo chmod a+r /etc/apt/keyrings/docker.gpg
-        
+
         echo \
             "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
             $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
             sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-        
+
         apt_safe update
         apt_safe install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-        
+
         log_success "Docker instalado"
     fi
-    
+
     # Adicionar usuário ao grupo docker
     if ! groups "$USER" | grep -q docker; then
         sudo usermod -aG docker "$USER"
         log_info "Usuário $USER adicionado ao grupo docker"
-        log_warning "Pode ser necessário relogar para aplicar permissões do grupo docker"
     fi
-    
+
     # Habilitar e iniciar Docker
     sudo systemctl enable docker
     sudo systemctl start docker
-    
-    # Aguardar Docker estar pronto
-    local docker_wait=0
-    while ! sudo docker info &>/dev/null && [[ $docker_wait -lt 30 ]]; do
-        sleep 2
-        ((docker_wait+=2))
-    done
-    
-    # Validar instalação
-    if ! sudo docker info &>/dev/null; then
-        log_error "Falha na validação do Docker"
-        exit 1
-    fi
-    
-    log_success "2.1 Docker operacional"
-    
-    # 2.2 Inicializar Swarm
-    log_progress "2.2 Inicializando Docker Swarm..."
-    
+
+    # Validar
+    sudo docker info > /dev/null 2>&1
+    log_success "Docker validado e funcionando"
+}
+
+#---------------------------------------
+# FASE 2.2 - Docker Swarm
+#---------------------------------------
+phase2_swarm() {
+    log_progress "FASE 2.2 - Inicializando Docker Swarm..."
+
+    # Verificar se já está em swarm
     if sudo docker info 2>/dev/null | grep -q "Swarm: active"; then
-        log_info "Docker Swarm já está ativo"
+        log_warning "Docker Swarm já está ativo"
     else
-        get_local_ip
-        
-        sudo docker swarm init --advertise-addr "$LOCAL_IP" || {
-            log_error "Falha ao inicializar Swarm"
-            exit 1
-        }
-        
+        # Detectar IP
+        LOCAL_IP=$(ip route get 1.1.1.1 | grep -oP 'src \K\S+')
+        log_info "IP detectado: $LOCAL_IP"
+
+        sudo docker swarm init --advertise-addr "$LOCAL_IP"
         log_success "Docker Swarm inicializado"
     fi
-    
+
     # Criar rede overlay
-    if sudo docker network ls | grep -q "$OVERLAY_NETWORK_NAME"; then
-        log_info "Rede $OVERLAY_NETWORK_NAME já existe"
+    if sudo docker network ls | grep -q "$OVERLAY_NETWORK"; then
+        log_warning "Rede $OVERLAY_NETWORK já existe"
     else
-        sudo docker network create -d overlay --attachable "$OVERLAY_NETWORK_NAME" || {
-            log_error "Falha ao criar rede overlay"
-            exit 1
-        }
-        log_success "Rede overlay $OVERLAY_NETWORK_NAME criada"
+        sudo docker network create -d overlay --attachable "$OVERLAY_NETWORK"
+        log_success "Rede overlay $OVERLAY_NETWORK criada"
     fi
-    
-    log_success "2.2 Docker Swarm configurado"
-    
-    # 2.3 Instalar btop
-    log_progress "2.3 Instalando btop..."
-    
-    if command -v btop &>/dev/null; then
-        log_info "btop já instalado"
+}
+
+#---------------------------------------
+# FASE 2.3 - btop
+#---------------------------------------
+phase2_btop() {
+    log_progress "FASE 2.3 - Instalando btop..."
+
+    if command -v btop &> /dev/null; then
+        log_warning "btop já está instalado"
     else
-        apt_safe install btop || {
-            log_warning "btop não disponível via apt, tentando snap..."
-            sudo snap install btop 2>/dev/null || log_warning "Falha ao instalar btop"
-        }
+        apt_safe install btop
+        log_success "btop instalado"
     fi
-    
-    log_success "2.3 btop instalado"
-    
-    # 2.4 Instalar ctop
-    log_progress "2.4 Instalando ctop..."
-    
-    if command -v ctop &>/dev/null; then
-        log_info "ctop já instalado"
+}
+
+#---------------------------------------
+# FASE 2.4 - ctop
+#---------------------------------------
+phase2_ctop() {
+    log_progress "FASE 2.4 - Instalando ctop..."
+
+    if command -v ctop &> /dev/null; then
+        log_warning "ctop já está instalado"
     else
-        local ctop_url="https://github.com/bcicen/ctop/releases/download/v0.7.7/ctop-0.7.7-linux-arm64"
-        if sudo wget -q "$ctop_url" -O /usr/local/bin/ctop; then
-            sudo chmod +x /usr/local/bin/ctop
-            log_success "ctop instalado"
+        CTOP_VERSION="0.7.7"
+        ARCH=$(uname -m)
+        
+        if [[ "$ARCH" == "aarch64" ]]; then
+            CTOP_ARCH="arm64"
         else
-            log_warning "Falha ao baixar ctop"
+            CTOP_ARCH="amd64"
         fi
+
+        wget -q "https://github.com/bcicen/ctop/releases/download/v${CTOP_VERSION}/ctop-${CTOP_VERSION}-linux-${CTOP_ARCH}" -O /tmp/ctop
+        sudo mv /tmp/ctop /usr/local/bin/ctop
+        sudo chmod +x /usr/local/bin/ctop
+        log_success "ctop instalado"
     fi
-    
-    log_success "2.4 ctop processado"
-    
-    # 2.5 Deploy Traefik
-    log_progress "2.5 Configurando e deployando Traefik..."
-    
-    # Verificar arquivo YAML
-    if [[ ! -f "$HOME/traefik.yml" ]]; then
-        log_error "Arquivo traefik.yml não encontrado em $HOME"
+}
+
+#---------------------------------------
+# Criar Docker Secrets
+#---------------------------------------
+create_docker_secrets() {
+    log_progress "Criando Docker Secrets..."
+
+    # Secret para senha do Portainer
+    if sudo docker secret ls | grep -q portainer_admin_password; then
+        log_warning "Secret portainer_admin_password já existe, removendo..."
+        sudo docker secret rm portainer_admin_password 2>/dev/null || true
+    fi
+    echo -n "$PORTAINER_PASS" | sudo docker secret create portainer_admin_password -
+
+    # Secret para senha do PostgreSQL
+    if sudo docker secret ls | grep -q postgres_password; then
+        log_warning "Secret postgres_password já existe, removendo..."
+        sudo docker secret rm postgres_password 2>/dev/null || true
+    fi
+    echo -n "$POSTGRES_PASS" | sudo docker secret create postgres_password -
+
+    log_success "Docker Secrets criados"
+}
+
+#---------------------------------------
+# Copiar e configurar YAMLs
+#---------------------------------------
+prepare_yaml_files() {
+    log_progress "Preparando arquivos YAML..."
+
+    # Copiar traefik.yml para HOME
+    if [[ -f "./traefik.yml" ]]; then
+        cp ./traefik.yml "$HOME/traefik.yml"
+        # Substituir variáveis
+        sed -i "s|\${SSL_EMAIL}|$SSL_EMAIL|g" "$HOME/traefik.yml"
+        sed -i "s|\${TRAEFIK_URL}|$TRAEFIK_URL|g" "$HOME/traefik.yml"
+        sed -i "s|\${OVERLAY_NETWORK}|$OVERLAY_NETWORK|g" "$HOME/traefik.yml"
+        log_success "traefik.yml copiado e configurado"
+    else
+        log_error "traefik.yml não encontrado!"
         exit 1
     fi
-    
-    # Substituir variáveis no arquivo
-    sed -i "s/\${SSL_EMAIL}/$SSL_EMAIL/g" "$HOME/traefik.yml"
-    sed -i "s/\${OVERLAY_NETWORK_NAME}/$OVERLAY_NETWORK_NAME/g" "$HOME/traefik.yml"
-    sed -i "s/\${PORTAINER_URL}/$PORTAINER_URL/g" "$HOME/traefik.yml"
-    
-    # Criar diretório para certificados
+
+    # Copiar portainer.yml para HOME
+    if [[ -f "./portainer.yml" ]]; then
+        cp ./portainer.yml "$HOME/portainer.yml"
+        # Substituir variáveis
+        sed -i "s|\${PORTAINER_URL}|$PORTAINER_URL|g" "$HOME/portainer.yml"
+        sed -i "s|\${OVERLAY_NETWORK}|$OVERLAY_NETWORK|g" "$HOME/portainer.yml"
+        log_success "portainer.yml copiado e configurado"
+    else
+        log_error "portainer.yml não encontrado!"
+        exit 1
+    fi
+}
+
+#---------------------------------------
+# FASE 2.5 - Traefik
+#---------------------------------------
+phase2_traefik() {
+    log_progress "FASE 2.5 - Instalando Traefik..."
+
+    # Criar diretório para ACME
     sudo mkdir -p /opt/traefik
     sudo touch /opt/traefik/acme.json
     sudo chmod 600 /opt/traefik/acme.json
-    
-    # Remover stack existente se houver
-    if sudo docker stack ls 2>/dev/null | grep -q "traefik"; then
-        log_progress "Removendo stack Traefik existente..."
+
+    # Deploy stack
+    if sudo docker stack ls | grep -q "^traefik"; then
+        log_warning "Stack traefik já existe, atualizando..."
         sudo docker stack rm traefik
-        
-        local remove_wait=0
-        while sudo docker stack ps traefik &>/dev/null && [[ $remove_wait -lt 60 ]]; do
-            sleep 2
-            ((remove_wait+=2))
-        done
-        sleep 5
+        sleep 10
     fi
-    
-    # Deploy
+
     sudo docker stack deploy -c "$HOME/traefik.yml" traefik
-    
+
     # Aguardar convergência
-    log_progress "Aguardando Traefik iniciar..."
-    local max_wait=120
-    local waited=0
-    
-    while [[ $waited -lt $max_wait ]]; do
-        local replicas
-        replicas=$(sudo docker service ls --format "{{.Replicas}}" --filter "name=traefik_traefik" 2>/dev/null || echo "0/0")
-        
-        if [[ "$replicas" == "1/1" ]]; then
-            log_success "Traefik iniciado"
-            break
+    log_info "Aguardando Traefik inicializar..."
+    local timeout=120
+    local elapsed=0
+
+    while [[ $elapsed -lt $timeout ]]; do
+        if sudo docker service ls | grep -q "traefik.*1/1"; then
+            log_success "Traefik iniciado com sucesso"
+            return 0
         fi
-        
         sleep 5
-        ((waited+=5))
-        log_info "Aguardando Traefik... ($waited/$max_wait segundos) - Status: $replicas"
+        ((elapsed+=5))
+        log_info "Aguardando Traefik... ($elapsed/$timeout segundos)"
     done
-    
-    if [[ $waited -ge $max_wait ]]; then
-        log_warning "Timeout aguardando Traefik. Verifique manualmente."
-    fi
-    
-    log_success "2.5 Traefik deployado"
-    
-    # 2.6 Deploy Portainer + Agent
-    log_progress "2.6 Configurando e deployando Portainer + Agent..."
-    
-    # Verificar arquivo YAML
-    if [[ ! -f "$HOME/portainer.yml" ]]; then
-        log_error "Arquivo portainer.yml não encontrado em $HOME"
-        exit 1
-    fi
-    
-    # Criar Docker Secrets para Portainer
-    echo -n "$PORTAINER_ADMIN_USER" | sudo docker secret create portainer_admin_user - 2>/dev/null || \
-        log_info "Secret portainer_admin_user já existe"
-    
-    echo -n "$PORTAINER_ADMIN_PASS" | sudo docker secret create portainer_admin_password - 2>/dev/null || \
-        log_info "Secret portainer_admin_password já existe"
-    
-    # Substituir variáveis no arquivo YAML
-    sed -i "s/\${PORTAINER_URL}/$PORTAINER_URL/g" "$HOME/portainer.yml"
-    sed -i "s/\${OVERLAY_NETWORK_NAME}/$OVERLAY_NETWORK_NAME/g" "$HOME/portainer.yml"
-    
-    # Volume para dados do Portainer
-    sudo docker volume create portainer_data 2>/dev/null || true
-    
-    # Remover stack existente se houver
-    if sudo docker stack ls 2>/dev/null | grep -q "portainer"; then
-        log_progress "Removendo stack Portainer existente..."
-        sudo docker stack rm portainer
-        
-        local remove_wait=0
-        while sudo docker stack ps portainer &>/dev/null && [[ $remove_wait -lt 60 ]]; do
-            sleep 2
-            ((remove_wait+=2))
-        done
-        sleep 5
-    fi
-    
-    # Deploy da stack
-    sudo docker stack deploy -c "$HOME/portainer.yml" portainer
-    
-    # Aguardar convergência do Portainer Server
-    log_progress "Aguardando Portainer Server iniciar..."
-    max_wait=180
-    waited=0
-    
-    while [[ $waited -lt $max_wait ]]; do
-        local replicas
-        replicas=$(sudo docker service ls --format "{{.Replicas}}" --filter "name=portainer_portainer" 2>/dev/null | head -1 || echo "0/0")
-        
-        if [[ "$replicas" == "1/1" ]]; then
-            log_success "Portainer Server iniciado"
-            break
-        fi
-        
-        sleep 5
-        ((waited+=5))
-        log_info "Aguardando Portainer Server... ($waited/$max_wait segundos) - Status: $replicas"
-    done
-    
-    if [[ $waited -ge $max_wait ]]; then
-        log_warning "Timeout aguardando Portainer Server. Verifique manualmente."
-        sudo docker service logs portainer_portainer --tail 50 2>/dev/null || true
-    fi
-    
-    # Aguardar convergência do Portainer Agent
-    log_progress "Aguardando Portainer Agent iniciar..."
-    waited=0
-    max_wait=120
-    
-    while [[ $waited -lt $max_wait ]]; do
-        local agent_status
-        agent_status=$(sudo docker service ls --format "{{.Replicas}}" --filter "name=portainer_portainer_agent" 2>/dev/null || echo "0/0")
-        
-        # Para modo global, verificar se está rodando em todos os nós
-        if [[ "$agent_status" =~ ^[1-9][0-9]*/[1-9][0-9]*$ ]]; then
-            local running="${agent_status%/*}"
-            local expected="${agent_status#*/}"
-            
-            if [[ "$running" == "$expected" ]]; then
-                log_success "Portainer Agent iniciado em $running nó(s)"
-                break
-            fi
-        fi
-        
-        sleep 5
-        ((waited+=5))
-        log_info "Aguardando Portainer Agent... ($waited/$max_wait segundos) - Status: $agent_status"
-    done
-    
-    if [[ $waited -ge $max_wait ]]; then
-        log_warning "Timeout aguardando Portainer Agent. Verifique manualmente."
-    fi
-    
-    # Validar conectividade HTTPS (se DNS estiver configurado)
-    log_progress "Verificando acesso HTTPS ao Portainer..."
-    local https_check_wait=0
-    local https_max_wait=60
-    
-    while [[ $https_check_wait -lt $https_max_wait ]]; do
-        local http_code
-        http_code=$(curl -sSf -o /dev/null -w "%{http_code}" --connect-timeout 5 "https://$PORTAINER_URL" 2>/dev/null || echo "000")
-        
-        if [[ "$http_code" =~ ^(200|302|303)$ ]]; then
-            log_success "Portainer acessível via HTTPS (HTTP $http_code)"
-            break
-        fi
-        
-        sleep 5
-        ((https_check_wait+=5))
-    done
-    
-    if [[ $https_check_wait -ge $https_max_wait ]]; then
-        log_warning "Não foi possível validar HTTPS. Isso pode ser normal se o DNS ainda não propagou."
-        log_info "Acesse https://$PORTAINER_URL após configurar o DNS"
-    fi
-    
-    log_success "2.6 Portainer + Agent deployados"
-    
-    log_success "FASE 2 CONCLUÍDA"
+
+    log_warning "Traefik pode ainda estar iniciando, continuando..."
 }
 
-#===============================================================================
-# FASE 3 - STACK POSTGRESQL
-#===============================================================================
-phase3_postgres() {
-    log_section "FASE 3 - STACK POSTGRESQL"
-    
-    log_progress "Configurando PostgreSQL stack..."
-    
-    # Criar Docker Secret para senha do Postgres
-    echo -n "$POSTGRES_PASSWORD" | sudo docker secret create postgres_n8n_password - 2>/dev/null || \
-        log_info "Secret postgres_n8n_password já existe"
-    
-    # Verificar se a rede overlay existe
-    if ! sudo docker network ls | grep -q "$OVERLAY_NETWORK_NAME"; then
-        log_error "Rede overlay $OVERLAY_NETWORK_NAME não encontrada"
-        exit 1
+#---------------------------------------
+# FASE 2.6 - Portainer
+#---------------------------------------
+phase2_portainer() {
+    log_progress "FASE 2.6 - Instalando Portainer..."
+
+    # Criar volume se não existir
+    if ! sudo docker volume ls | grep -q portainer_data; then
+        sudo docker volume create portainer_data
     fi
-    
-    # Gerar arquivo postgres_n8n.yml
+
+    # Deploy stack
+    if sudo docker stack ls | grep -q "^portainer"; then
+        log_warning "Stack portainer já existe, atualizando..."
+        sudo docker stack rm portainer
+        sleep 10
+    fi
+
+    sudo docker stack deploy -c "$HOME/portainer.yml" portainer
+
+    # Aguardar convergência
+    log_info "Aguardando Portainer inicializar..."
+    local timeout=120
+    local elapsed=0
+
+    while [[ $elapsed -lt $timeout ]]; do
+        if sudo docker service ls | grep -q "portainer.*1/1"; then
+            log_success "Portainer iniciado com sucesso"
+            return 0
+        fi
+        sleep 5
+        ((elapsed+=5))
+        log_info "Aguardando Portainer... ($elapsed/$timeout segundos)"
+    done
+
+    log_warning "Portainer pode ainda estar iniciando, continuando..."
+}
+
+#---------------------------------------
+# FASE 3 - PostgreSQL Stack
+#---------------------------------------
+phase3_postgres() {
+    log_progress "FASE 3 - Criando Stack PostgreSQL..."
+
+    # Gerar arquivo YAML
     cat > "$HOME/postgres_n8n.yml" << EOF
-version: "3.8"
+version: '3.8'
 
 services:
   postgres_n8n:
@@ -1054,42 +883,34 @@ services:
     environment:
       POSTGRES_USER: postgres
       POSTGRES_DB: n8n
-      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_n8n_password
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     secrets:
-      - postgres_n8n_password
+      - postgres_password
     volumes:
       - postgres_n8n_data:/var/lib/postgresql/data
     networks:
-      - $OVERLAY_NETWORK_NAME
+      - ${OVERLAY_NETWORK}
     ports:
-      - published: 5432
-        target: 5432
-        mode: host
+      - "5432:5432"
     deploy:
       mode: replicated
       replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
       restart_policy:
         condition: on-failure
         delay: 5s
         max_attempts: 3
-        window: 120s
       resources:
         limits:
           memory: 512M
-        reservations:
-          memory: 256M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d n8n"]
-      interval: 30s
-      timeout: 10s
+      interval: 10s
+      timeout: 5s
       retries: 5
       start_period: 30s
 
 secrets:
-  postgres_n8n_password:
+  postgres_password:
     external: true
 
 volumes:
@@ -1097,85 +918,57 @@ volumes:
     driver: local
 
 networks:
-  $OVERLAY_NETWORK_NAME:
+  ${OVERLAY_NETWORK}:
     external: true
 EOF
 
     log_success "Arquivo postgres_n8n.yml gerado em $HOME"
-    
-    # Remover stack existente
-    if sudo docker stack ls 2>/dev/null | grep -q "postgres_n8n"; then
-        log_progress "Removendo stack postgres_n8n existente..."
-        sudo docker stack rm postgres_n8n
-        
-        local remove_wait=0
-        while sudo docker stack ps postgres_n8n &>/dev/null && [[ $remove_wait -lt 60 ]]; do
-            sleep 2
-            ((remove_wait+=2))
-        done
-        sleep 5
-    fi
-    
+
     # Deploy
+    if sudo docker stack ls | grep -q "^postgres_n8n"; then
+        log_warning "Stack postgres_n8n já existe, atualizando..."
+        sudo docker stack rm postgres_n8n
+        sleep 15
+    fi
+
     sudo docker stack deploy -c "$HOME/postgres_n8n.yml" postgres_n8n
-    
-    # Aguardar convergência (timeout 300s)
-    log_progress "Aguardando PostgreSQL iniciar (timeout: 300s)..."
-    local max_wait=300
-    local waited=0
-    
-    while [[ $waited -lt $max_wait ]]; do
-        local replicas
-        replicas=$(sudo docker service ls --format "{{.Replicas}}" --filter "name=postgres_n8n_postgres_n8n" 2>/dev/null || echo "0/0")
-        
-        if [[ "$replicas" == "1/1" ]]; then
-            log_success "PostgreSQL iniciado"
-            break
+
+    # Aguardar convergência
+    log_info "Aguardando PostgreSQL inicializar..."
+    local timeout=300
+    local elapsed=0
+
+    while [[ $elapsed -lt $timeout ]]; do
+        if sudo docker service ls | grep -q "postgres_n8n.*1/1"; then
+            log_success "PostgreSQL iniciado com sucesso"
+            
+            # Validar porta
+            sleep 5
+            if ss -lntup | grep -q ":5432"; then
+                log_success "PostgreSQL escutando na porta 5432"
+            else
+                log_warning "Porta 5432 pode ainda não estar disponível"
+            fi
+            return 0
         fi
-        
         sleep 10
-        ((waited+=10))
-        log_info "Aguardando PostgreSQL... ($waited/$max_wait segundos) - Status: $replicas"
+        ((elapsed+=10))
+        log_info "Aguardando PostgreSQL... ($elapsed/$timeout segundos)"
     done
-    
-    if [[ $waited -ge $max_wait ]]; then
-        log_error "Timeout aguardando PostgreSQL"
-        sudo docker service logs postgres_n8n_postgres_n8n --tail 50 2>/dev/null || true
-        exit 1
-    fi
-    
-    # Validar porta 5432
-    sleep 10  # Aguardar binding da porta
-    if ss -lntup 2>/dev/null | grep -q ":5432"; then
-        log_success "PostgreSQL listening na porta 5432"
-    else
-        log_warning "Porta 5432 pode não estar disponível externamente ainda"
-    fi
-    
-    # Adicionar regra UFW para Postgres
-    sudo ufw allow 5432/tcp
-    log_info "Regra UFW adicionada para porta 5432"
-    
-    log_success "FASE 3 CONCLUÍDA - PostgreSQL deployado"
+
+    log_error "Timeout aguardando PostgreSQL"
+    return 1
 }
 
-#===============================================================================
-# FASE 4 - STACK REDIS
-#===============================================================================
+#---------------------------------------
+# FASE 4 - Redis Stack
+#---------------------------------------
 phase4_redis() {
-    log_section "FASE 4 - STACK REDIS"
-    
-    log_progress "Configurando Redis stack..."
-    
-    # Verificar se a rede overlay existe
-    if ! sudo docker network ls | grep -q "$OVERLAY_NETWORK_NAME"; then
-        log_error "Rede overlay $OVERLAY_NETWORK_NAME não encontrada"
-        exit 1
-    fi
-    
-    # Gerar arquivo redis_n8n.yml
+    log_progress "FASE 4 - Criando Stack Redis..."
+
+    # Gerar arquivo YAML
     cat > "$HOME/redis_n8n.yml" << EOF
-version: "3.8"
+version: '3.8'
 
 services:
   redis_n8n:
@@ -1184,28 +977,21 @@ services:
     volumes:
       - redis_n8n_data:/data
     networks:
-      - $OVERLAY_NETWORK_NAME
-    # Sem ports: expostos - acesso apenas interno via rede overlay
+      - ${OVERLAY_NETWORK}
     deploy:
       mode: replicated
       replicas: 1
-      placement:
-        constraints:
-          - node.role == manager
       restart_policy:
         condition: on-failure
         delay: 5s
         max_attempts: 3
-        window: 120s
       resources:
         limits:
           memory: 256M
-        reservations:
-          memory: 128M
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
+      interval: 10s
+      timeout: 5s
       retries: 5
       start_period: 10s
 
@@ -1214,206 +1000,224 @@ volumes:
     driver: local
 
 networks:
-  $OVERLAY_NETWORK_NAME:
+  ${OVERLAY_NETWORK}:
     external: true
 EOF
 
     log_success "Arquivo redis_n8n.yml gerado em $HOME"
-    
-    # Remover stack existente
-    if sudo docker stack ls 2>/dev/null | grep -q "redis_n8n"; then
-        log_progress "Removendo stack redis_n8n existente..."
-        sudo docker stack rm redis_n8n
-        
-        local remove_wait=0
-        while sudo docker stack ps redis_n8n &>/dev/null && [[ $remove_wait -lt 60 ]]; do
-            sleep 2
-            ((remove_wait+=2))
-        done
-        sleep 5
-    fi
-    
+
     # Deploy
+    if sudo docker stack ls | grep -q "^redis_n8n"; then
+        log_warning "Stack redis_n8n já existe, atualizando..."
+        sudo docker stack rm redis_n8n
+        sleep 10
+    fi
+
     sudo docker stack deploy -c "$HOME/redis_n8n.yml" redis_n8n
-    
+
     # Aguardar convergência
-    log_progress "Aguardando Redis iniciar..."
-    local max_wait=120
-    local waited=0
-    
-    while [[ $waited -lt $max_wait ]]; do
-        local replicas
-        replicas=$(sudo docker service ls --format "{{.Replicas}}" --filter "name=redis_n8n_redis_n8n" 2>/dev/null || echo "0/0")
-        
-        if [[ "$replicas" == "1/1" ]]; then
-            log_success "Redis iniciado"
-            break
+    log_info "Aguardando Redis inicializar..."
+    local timeout=120
+    local elapsed=0
+
+    while [[ $elapsed -lt $timeout ]]; do
+        if sudo docker service ls | grep -q "redis_n8n.*1/1"; then
+            log_success "Redis iniciado com sucesso"
+            return 0
         fi
-        
         sleep 5
-        ((waited+=5))
-        log_info "Aguardando Redis... ($waited/$max_wait segundos) - Status: $replicas"
+        ((elapsed+=5))
+        log_info "Aguardando Redis... ($elapsed/$timeout segundos)"
     done
-    
-    if [[ $waited -ge $max_wait ]]; then
-        log_warning "Timeout aguardando Redis. Verifique manualmente."
-    fi
-    
-    log_success "FASE 4 CONCLUÍDA - Redis deployado"
+
+    log_warning "Redis pode ainda estar iniciando..."
 }
 
-#===============================================================================
-# VALIDAÇÕES FINAIS E DNS
-#===============================================================================
-validate_dns_connectivity() {
-    log_section "VALIDAÇÃO DNS E CONECTIVIDADE"
+#---------------------------------------
+# Validação DNS
+#---------------------------------------
+validate_dns() {
+    log_progress "Validando configuração DNS..."
+
+    PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || curl -s api.ipify.org 2>/dev/null || echo "N/A")
     
-    get_public_ip
-    
-    log_info "Verificando resolução DNS para $PORTAINER_URL..."
-    
-    local resolved_ip
-    resolved_ip=$(dig +short "$PORTAINER_URL" 2>/dev/null | head -1 || echo "")
-    
-    if [[ -z "$resolved_ip" ]]; then
-        log_warning "DNS para $PORTAINER_URL não resolveu"
-        log_warning "Configure o registro DNS apontando para: $PUBLIC_IP"
-    elif [[ "$resolved_ip" == "$PUBLIC_IP" ]]; then
-        log_success "DNS $PORTAINER_URL -> $PUBLIC_IP (correto)"
-    else
-        log_warning "DNS $PORTAINER_URL resolve para $resolved_ip"
-        log_warning "IP público detectado: $PUBLIC_IP"
-        log_warning "Verifique se o DNS está correto"
+    if [[ "$PUBLIC_IP" != "N/A" ]]; then
+        log_info "IP Público: $PUBLIC_IP"
+
+        # Verificar Portainer
+        if command -v dig &> /dev/null; then
+            PORTAINER_DNS=$(dig +short "$PORTAINER_URL" | head -1)
+            if [[ -n "$PORTAINER_DNS" ]]; then
+                if [[ "$PORTAINER_DNS" == "$PUBLIC_IP" ]]; then
+                    log_success "DNS de $PORTAINER_URL aponta corretamente para $PUBLIC_IP"
+                else
+                    log_warning "DNS de $PORTAINER_URL aponta para $PORTAINER_DNS (esperado: $PUBLIC_IP)"
+                fi
+            else
+                log_warning "DNS de $PORTAINER_URL não configurado"
+            fi
+
+            TRAEFIK_DNS=$(dig +short "$TRAEFIK_URL" | head -1)
+            if [[ -n "$TRAEFIK_DNS" ]]; then
+                if [[ "$TRAEFIK_DNS" == "$PUBLIC_IP" ]]; then
+                    log_success "DNS de $TRAEFIK_URL aponta corretamente para $PUBLIC_IP"
+                else
+                    log_warning "DNS de $TRAEFIK_URL aponta para $TRAEFIK_DNS (esperado: $PUBLIC_IP)"
+                fi
+            else
+                log_warning "DNS de $TRAEFIK_URL não configurado"
+            fi
+        fi
     fi
 }
 
-#===============================================================================
-# RESUMO FINAL
-#===============================================================================
-print_summary() {
-    log_section "INSTALAÇÃO CONCLUÍDA"
-    
-    # Atualizar IP público
-    get_public_ip
-    
-    echo ""
-    echo "╔═══════════════════════════════════════════════════════════════════════════════╗"
-    echo "║                        RESUMO DA INSTALAÇÃO                                   ║"
-    echo "╚═══════════════════════════════════════════════════════════════════════════════╝"
-    echo ""
-    echo "📋 SERVIÇOS INSTALADOS:"
-    echo "   ├── Docker Engine + Docker Compose"
-    echo "   ├── Docker Swarm (nó manager)"
-    echo "   ├── Traefik (reverse proxy + SSL)"
-    echo "   ├── Portainer CE (gerenciamento)"
-    echo "   ├── Portainer Agent (comunicação Swarm)"
-    echo "   ├── PostgreSQL 16 (stack: postgres_n8n)"
-    echo "   └── Redis 7 (stack: redis_n8n)"
-    echo ""
-    echo "🌐 ACESSO:"
-    echo "   ├── Portainer: https://$PORTAINER_URL"
-    echo "   │   ├── Usuário: $PORTAINER_ADMIN_USER"
-    echo "   │   └── Senha: [configurada - criar no primeiro acesso]"
-    echo "   │"
-    echo "   ├── PostgreSQL: $PUBLIC_IP:5432"
-    echo "   │   ├── Database: n8n"
-    echo "   │   ├── Usuário: postgres"
-    echo "   │   └── Senha: [configurada via Docker Secret]"
-    echo "   │"
-    echo "   └── Redis: redis_n8n_redis_n8n:6379 (apenas interno via rede $OVERLAY_NETWORK_NAME)"
-    echo ""
-    echo "📁 ARQUIVOS GERADOS:"
-    echo "   ├── $ENV_FILE (configurações)"
-    echo "   ├── $HOME/traefik.yml"
-    echo "   ├── $HOME/portainer.yml"
-    echo "   ├── $HOME/postgres_n8n.yml"
-    echo "   ├── $HOME/redis_n8n.yml"
-    echo "   └── $LOG_FILE (log de instalação)"
-    echo ""
-    echo "🔑 DOCKER SECRETS CRIADOS:"
-    echo "   ├── portainer_admin_user"
-    echo "   ├── portainer_admin_password"
-    echo "   └── postgres_n8n_password"
-    echo ""
-    echo "🔧 COMANDOS ÚTEIS:"
-    echo "   ├── docker service ls              # Listar serviços"
-    echo "   ├── docker stack ls                # Listar stacks"
-    echo "   ├── docker service logs <serviço>  # Ver logs"
-    echo "   ├── btop                           # Monitor de sistema"
-    echo "   └── ctop                           # Monitor de containers"
-    echo ""
-    
-    # Verificar stacks
-    echo "📊 STATUS DAS STACKS:"
-    sudo docker service ls
-    echo ""
-    
-    if [[ "$REBOOT_RECOMMENDED" == true ]]; then
-        echo "╔═══════════════════════════════════════════════════════════════════════════════╗"
-        echo "║  ⚠️  REBOOT RECOMENDADO                                                       ║"
-        echo "║                                                                               ║"
-        echo "║  O kernel foi atualizado durante a instalação.                               ║"
-        echo "║  Recomendamos reiniciar o servidor para aplicar as alterações:               ║"
-        echo "║                                                                               ║"
-        echo "║    sudo reboot                                                               ║"
-        echo "║                                                                               ║"
-        echo "╚═══════════════════════════════════════════════════════════════════════════════╝"
-        echo ""
+#---------------------------------------
+# Verificar necessidade de reboot
+#---------------------------------------
+check_reboot_required() {
+    if [[ -f /var/run/reboot-required ]]; then
+        log_warning "⚠️  REBOOT RECOMENDADO: Uma atualização de kernel foi instalada"
+        log_info "Execute 'sudo reboot' quando conveniente"
+        return 1
     fi
-    
-    echo "⚠️  IMPORTANTE: No primeiro acesso ao Portainer, você precisará criar"
-    echo "   a senha do administrador na interface web."
+    return 0
+}
+
+#---------------------------------------
+# Resumo final
+#---------------------------------------
+show_summary() {
+    PUBLIC_IP=$(curl -s ifconfig.me 2>/dev/null || curl -s api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
+
     echo ""
-    echo "✅ Instalação concluída com sucesso!"
+    echo -e "${GREEN}${BOLD}"
+    echo "╔═══════════════════════════════════════════════════════════════════════════╗"
+    echo "║                                                                           ║"
+    echo "║              ✅ INSTALAÇÃO CONCLUÍDA COM SUCESSO!                         ║"
+    echo "║                                                                           ║"
+    echo "╚═══════════════════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+
+    echo -e "${CYAN}${BOLD}📋 SERVIÇOS INSTALADOS:${NC}"
+    echo ""
+    
+    echo -e "${YELLOW}Portainer:${NC}"
+    echo -e "   URL: ${BOLD}https://${PORTAINER_URL}${NC}"
+    echo -e "   Usuário: ${BOLD}${PORTAINER_USER}${NC}"
+    echo -e "   (Configure a senha no primeiro acesso ou via API)"
+    echo ""
+
+    echo -e "${YELLOW}Traefik Dashboard:${NC}"
+    echo -e "   URL: ${BOLD}https://${TRAEFIK_URL}${NC}"
+    echo ""
+
+    echo -e "${YELLOW}PostgreSQL:${NC}"
+    echo -e "   Host externo: ${BOLD}${PUBLIC_IP}:5432${NC}"
+    echo -e "   Host interno (Docker): ${BOLD}postgres_n8n_postgres_n8n:5432${NC}"
+    echo -e "   Database: ${BOLD}n8n${NC}"
+    echo -e "   Usuário: ${BOLD}postgres${NC}"
+    echo ""
+
+    echo -e "${YELLOW}Redis:${NC}"
+    echo -e "   Host interno (Docker): ${BOLD}redis_n8n_redis_n8n:6379${NC}"
+    echo -e "   (Não exposto externamente - acesso apenas via rede overlay)"
+    echo ""
+
+    echo -e "${CYAN}${BOLD}📁 ARQUIVOS GERADOS:${NC}"
+    echo -e "   Configurações: ${BOLD}${ENV_FILE}${NC}"
+    echo -e "   Traefik Stack: ${BOLD}$HOME/traefik.yml${NC}"
+    echo -e "   Portainer Stack: ${BOLD}$HOME/portainer.yml${NC}"
+    echo -e "   PostgreSQL Stack: ${BOLD}$HOME/postgres_n8n.yml${NC}"
+    echo -e "   Redis Stack: ${BOLD}$HOME/redis_n8n.yml${NC}"
+    echo -e "   Log: ${BOLD}${LOG_FILE}${NC}"
+    echo ""
+
+    echo -e "${CYAN}${BOLD}🔧 COMANDOS ÚTEIS:${NC}"
+    echo -e "   Ver stacks: ${BOLD}docker stack ls${NC}"
+    echo -e "   Ver serviços: ${BOLD}docker service ls${NC}"
+    echo -e "   Logs Traefik: ${BOLD}docker service logs traefik_traefik${NC}"
+    echo -e "   Logs Portainer: ${BOLD}docker service logs portainer_portainer${NC}"
+    echo -e "   Logs PostgreSQL: ${BOLD}docker service logs postgres_n8n_postgres_n8n${NC}"
+    echo -e "   Logs Redis: ${BOLD}docker service logs redis_n8n_redis_n8n${NC}"
+    echo -e "   Monitor: ${BOLD}ctop${NC} ou ${BOLD}btop${NC}"
+    echo ""
+
+    echo -e "${CYAN}${BOLD}🌐 REDE OVERLAY:${NC}"
+    echo -e "   Nome: ${BOLD}${OVERLAY_NETWORK}${NC}"
+    echo ""
+
+    # Verificar reboot
+    check_reboot_required || true
+
+    echo -e "${GREEN}Documentação: https://github.com/calicchiom/infrapro-oracle-cloud${NC}"
     echo ""
 }
 
-#===============================================================================
-# MAIN
-#===============================================================================
+#---------------------------------------
+# Main
+#---------------------------------------
 main() {
-    # Parse argumentos
-    parse_args "$@"
-    
-    # Verificar se está dentro do repositório
-    check_inside_repo
-    
-    # Inicializar log
-    log_init
-    
-    # Banner
-    print_banner
-    
+    show_banner
+
+    # Bootstrap (clonar repo se necessário)
+    bootstrap
+
     # Verificações iniciais
-    log_section "VERIFICAÇÕES INICIAIS"
-    check_root
     check_architecture
-    check_ubuntu_version
-    check_internet
-    get_local_ip
-    get_public_ip
-    
-    # Bootstrap (clone repo) se necessário
-    if [[ "$INSIDE_REPO" != true ]] && [[ "$FROM_BOOTSTRAP" != true ]]; then
-        bootstrap_clone_repo
-        # Se chegou aqui, bootstrap falhou
-        exit 1
-    fi
-    
-    # Coletar inputs do usuário
+    check_ubuntu
+    check_sudo
+
+    # Coletar inputs
     collect_inputs
-    
-    # Executar fases
-    phase1_prepare_ubuntu
-    phase2_docker_stack
+
+    # Salvar configurações
+    save_env
+
+    echo ""
+    log_info "Iniciando instalação em 5 segundos... (Ctrl+C para cancelar)"
+    sleep 5
+
+    # FASE 1 - Preparação Ubuntu
+    phase1_disable_auto_updates
+    phase1_remove_unattended
+    phase1_update_system
+    phase1_configure_ufw
+
+    # Instalar dependências
+    install_dependencies
+
+    # FASE 2 - Docker + Swarm + Traefik + Portainer
+    phase2_docker
+    phase2_swarm
+    phase2_btop
+    phase2_ctop
+
+    # Criar Docker Secrets
+    create_docker_secrets
+
+    # Preparar YAMLs
+    prepare_yaml_files
+
+    # Deploy Traefik e Portainer
+    phase2_traefik
+    phase2_portainer
+
+    # FASE 3 - PostgreSQL
     phase3_postgres
+
+    # FASE 4 - Redis
     phase4_redis
-    
-    # Validações finais
-    validate_dns_connectivity
-    
-    # Resumo
-    print_summary
+
+    # Validação DNS
+    validate_dns
+
+    # Resumo final
+    show_summary
+
+    # Limpar flag de bootstrap
+    rm -f "$BOOTSTRAP_FLAG"
+
+    log_success "Instalação finalizada!"
 }
 
 # Executar
